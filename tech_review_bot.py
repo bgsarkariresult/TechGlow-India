@@ -1,12 +1,8 @@
 import os
 import re
-import io
-import sys
 import json
 import time
-import glob
 import asyncio
-import logging
 import requests
 import subprocess
 from bs4 import BeautifulSoup
@@ -15,22 +11,57 @@ import edge_tts
 from gtts import gTTS
 from PIL import Image, ImageDraw, ImageFont
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
-client = Client()
+# PATCH: Fix moviepy ANTIALIAS issue
+if not hasattr(Image, 'ANTIALIAS'):
+    Image.ANTIALIAS = Image.Resampling.LANCZOS
 
-# ================= 1. CONFIGURATION =================
-BUFFER_ACCESS_TOKEN = os.environ.get("BUFFER_ACCESS_TOKEN", "")
-OUTPUT_DIR = "generated_reels"
-os.makedirs(OUTPUT_DIR, exist_ok=True)
-DEFAULT_FALLBACK_IMAGE = "https://via.placeholder.com/1080x1920.png?text=Product+Image"
+from moviepy.editor import ImageClip, AudioFileClip, VideoFileClip
+from playwright.sync_api import sync_playwright
+
+# Google API Imports
+from google_auth_oauthlib.flow import InstalledAppFlow
+from google.oauth2.credentials import Credentials
+from google.auth.transport.requests import Request
+from googleapiclient.discovery import build
+from googleapiclient.http import MediaFileUpload
+
+# ==========================================
+# CONFIGURATION
+# ==========================================
+GEMINI_API_KEYS = [
+    os.getenv("GEMINI_API_KEY_1", "").strip(),
+    os.getenv("GEMINI_API_KEY_2", "").strip(),
+    os.getenv("GEMINI_API_KEY_3", "").strip(),
+]
+GEMINI_API_KEYS = [k for k in GEMINI_API_KEYS if k]  # sirf khali nahi wale keys
+
+if not GEMINI_API_KEYS:
+    print("⚠️ Warning: Koi bhi GEMINI_API_KEY_1/2/3 nahi mila. GitHub Secrets check karo!")
+
+# Har key ke liye ek client bana lo (g4f k through), 1 fail ho to agla try hoga
+GEMINI_CLIENTS = []
+for idx, key in enumerate(GEMINI_API_KEYS, start=1):
+    try:
+        GEMINI_CLIENTS.append((f"KEY_{idx}", Client(api_key=key)))
+    except Exception as e:
+        print(f"⚠️ GEMINI_API_KEY_{idx} se client banane me error: {e}")
+
+# Free/no-key fallback client (gpt-4o-mini ke liye)
+fallback_client = Client()
+
+SCOPES = ['https://www.googleapis.com/auth/youtube.upload']
 MAX_CHUNK_CHARACTERS = 1000
 MAX_RETRIES = 3
 
-# ================= Telegram Notifier =================
+# ==========================================
+# Telegram Notifier — status + errors dono bhejta hai
+# ==========================================
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
 
 def notify_telegram(message: str):
+    """GitHub Actions ke runner se seedha Telegram par message bhejta hai.
+    Agar token/chat id set nahi hai to chup-chaap skip karega (crash nahi karega)."""
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
         return
     try:
@@ -42,362 +73,354 @@ def notify_telegram(message: str):
             "disable_web_page_preview": False
         }, timeout=20)
     except Exception as e:
-        logging.warning(f"⚠️ Telegram notify failed: {e}")
+        print(f"⚠️ Telegram notify failed: {e}")
 
-# ================= 2. FONT SYSTEM =================
-def get_system_font(font_size=55):
-    font_paths = [
-        "C:\\Windows\\Fonts\\arialbd.ttf",
-        "C:\\Windows\\Fonts\\NirmalaB.ttf",
-        "C:\\Windows\\Fonts\\seguiemj.ttf",
-        "C:\\Windows\\Fonts\\arial.ttf",
-        "C:\\Windows\\Fonts\\segoeui.ttf",
-        "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
-        "/usr/share/fonts/truetype/liberation/LiberationSans-Bold.ttf",
-    ]
-    for p in font_paths:
-        if os.path.exists(p):
+# ==========================================
+# YOUTUBE AUTH
+# ==========================================
+def get_youtube_service():
+    creds = None
+    token_file = 'token.json'
+    if os.path.exists(token_file):
+        creds = Credentials.from_authorized_user_file(token_file, SCOPES)
+    if not creds or not creds.valid:
+        if creds and creds.expired and creds.refresh_token:
+            creds.refresh(Request())
+        else:
+            if not os.path.exists('client_secrets.json'):
+                print("❌ 'client_secrets.json' missing.")
+                notify_telegram("❌ 'client_secrets.json' missing hai, YouTube upload skip ho gaya.")
+                return None
+            flow = InstalledAppFlow.from_client_secrets_file('client_secrets.json', SCOPES)
+            creds = flow.run_local_server(port=0)
+        with open(token_file, 'w') as token:
+            token.write(creds.to_json())
+    return build('youtube', 'v3', credentials=creds)
+
+# ==========================================
+# TECH REVIEW SCRAPER
+# ==========================================
+def extract_tech_review_content(url):
+    print(f"🔍 Scraping Tech Review from: {url}")
+    headers = {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36'
+    }
+    try:
+        response = requests.get(url, headers=headers, timeout=15)
+        response.raise_for_status()
+
+        soup = BeautifulSoup(response.text, 'html.parser')
+
+        title = (
+            soup.find('h1') or
+            soup.find('h3', class_='post-title') or
+            soup.find('h2') or
+            soup.find('title')
+        )
+        title_text = title.get_text(strip=True) if title else "Tech Review Product"
+
+        if '|' in title_text:
+            title_text = title_text.split('|')[0].strip()
+        elif '-' in title_text and len(title_text) > 40:
+            title_text = title_text.split('-')[0].strip()
+
+        body = (
+            soup.find('div', class_='post-body') or
+            soup.find('article') or
+            soup.find('main') or
+            soup.find('div', id='content') or
+            soup.find('body')
+        )
+
+        content_text = ""
+        specs = {}
+
+        if body:
+            for tag in body(['script', 'style', 'header', 'footer', 'nav', 'noscript', 'form']):
+                tag.decompose()
+
+            paragraphs = [p.get_text(strip=True) for p in body.find_all(['p', 'li', 'h2', 'h3', 'td', 'span']) if len(p.get_text(strip=True)) > 15]
+            content_text = "\n".join(paragraphs)
+
+            if len(content_text.strip()) < 100:
+                content_text = body.get_text(separator=' ', strip=True)
+
+            for p in body.find_all(['p', 'div', 'li', 'td', 'tr', 'span']):
+                text = p.get_text(strip=True)
+                if not text:
+                    continue
+                if ('Price' in text or '₹' in text or 'Rs' in text) and 'price' not in specs:
+                    specs['price'] = text
+                if ('Rating' in text or '★' in text) and 'rating' not in specs:
+                    specs['rating'] = text
+                if ('Battery' in text or 'mAh' in text or 'Playback' in text or 'Hours' in text) and 'battery' not in specs:
+                    specs['battery'] = text
+                if ('Pros' in text or 'Fayde' in text or 'Good' in text) and 'pros' not in specs:
+                    specs['pros'] = text
+                if ('Cons' in text or 'Kamiya' in text or 'Bad' in text) and 'cons' not in specs:
+                    specs['cons'] = text
+                if ('Driver' in text or 'Watt' in text or 'W' in text or 'Sound' in text) and 'audio' not in specs:
+                    specs['audio'] = text
+
+        if not content_text or len(content_text.strip()) < 50:
+            print("⚠️ Warning: Extracted content is extremely short.")
+            return None, None, None
+
+        print(f"✅ Tech Review extracted successfully! ({len(content_text)} chars)")
+        return title_text, content_text[:4000], specs
+    except Exception as e:
+        print(f"❌ Error during scraping: {e}")
+        return None, None, None
+
+# ==========================================
+# AI GENERATOR (Primary: gemini-3.6-flash → Fallback: gpt-4o-mini)
+# ==========================================
+def _parse_ai_json(raw_text):
+    """AI response se JSON nikalta hai — ```json fence, raw {..}, ya plain text teeno tarah try karta hai."""
+    json_data = None
+    json_match = re.search(r'```json\s*([\s\S]*?)\s*```', raw_text)
+    if json_match:
+        try:
+            json_data = json.loads(json_match.group(1))
+        except Exception:
+            pass
+    if not json_data:
+        json_match = re.search(r'\{[\s\S]*\}', raw_text)
+        if json_match:
             try:
-                return ImageFont.truetype(p, font_size)
+                json_data = json.loads(json_match.group())
             except Exception:
                 pass
-    return ImageFont.load_default()
+    if not json_data:
+        try:
+            json_data = json.loads(raw_text)
+        except Exception:
+            pass
+    return json_data
 
-def remove_emojis(text):
-    return re.sub(r'[^\x00-\x7F]+', '', text).strip()
 
-def sanitize_filename(name):
-    clean = re.sub(r'[^\w\s-]', '', name).strip().replace(' ', '_')
-    return clean[:30] if clean else "product_reel"
+def generate_youtube_assets_tech(title, content, specs, max_retries=3):
+    print("🤖 Generating Tech Review YouTube Assets...")
 
-# ================= 3. PRODUCT SCRAPER =================
-def unshorten_amazon_url(url, session):
-    if not any(domain in url for domain in ["amzn.to", "link.amazon", "earnkaro", "fktr.in", "linkredirect.in"]):
-        return url
-    try:
-        logging.info(f"🔍 Tracing redirect for: {url}")
-        res = session.get(url, allow_redirects=True, timeout=15)
-        soup = BeautifulSoup(res.content, "html.parser")
-        
-        meta_refresh = soup.find("meta", attrs={"http-equiv": re.compile(r"refresh", re.I)})
-        if meta_refresh:
-            content = meta_refresh.get("content", "")
-            match = re.search(r"url=['\"]?(.*?)['\"]?$", content, re.I)
-            if match:
-                redirect_url = match.group(1).strip()
-                res = session.get(redirect_url, allow_redirects=True, timeout=15)
-                soup = BeautifulSoup(res.content, "html.parser")
-        scripts = soup.find_all("script")
-        for script in scripts:
-            if script.string:
-                target_match = re.search(r"['\"](https://(?:www\.|dl\.)?(?:flipkart\.com|amazon\.in)[^'\"]+)['\"]", script.string)
-                if target_match:
-                    redirect_url = target_match.group(1).strip()
-                    res = session.get(redirect_url, allow_redirects=True, timeout=15)
-                    soup = BeautifulSoup(res.content, "html.parser")
-                    break
-        if "amazon." in res.url or "flipkart." in res.url:
-            logging.info(f"✅ Final Unshortened URL: {res.url[:70]}...")
-            return res.url
-    except Exception as e:
-        logging.warning(f"⚠️ Redirect resolution failed: {e}")
-    return url
+    specs_text = "\n".join([f"- {k}: {v}" for k, v in specs.items() if v])
+    product_name = title.split(':')[0] if ':' in title else title[:30]
 
-def scrape_bgtechlab_page(url, session):
-    data = {
-        "title": "",
-        "category": "",
-        "price": "Special Offer",
-        "has_real_price": False,
-        "image": "",
-        "extra_images": [],
-        "features": []
+    price = "₹2,699"
+    for key, value in specs.items():
+        if 'price' in key.lower() or '₹' in str(value):
+            price_match = re.search(r'₹[\d,]+', str(value))
+            if price_match:
+                price = price_match.group()
+                break
+
+    # Updated stronger clickbait titles + engaging style
+    base_prompt = f"""
+You are a professional Tech Reviewer for YouTube channel 'TechGlow India'.
+
+Create content for a YouTube video based on this Tech Review Blog Post:
+
+PRODUCT NAME: {product_name}
+TITLE: {title}
+PRICE: {price}
+
+SPECIFICATIONS:
+{specs_text}
+
+BLOG CONTENT:
+{content}
+
+CRITICAL RULES:
+1. SEO TITLES must be HIGHLY CLICKBAIT (use 🔥, urgency, curiosity, shock, FOMO, "Don't Buy Before Watching", "Real Test", "Honest Truth" etc.)
+2. VIDEO SCRIPT:
+   - ALWAYS start with a STRONG, UNIQUE, ENGAGING HOOK (problem, shock, curiosity, urgency) — NEVER start with "नमस्ते दोस्तों" or generic greetings
+   - Every video must have a DIFFERENT style of hook
+   - Pure DEVANAGARI HINDI only
+   - Total words: 500-750 (3-5 minute video)
+   - Highly conversational, natural, energetic and engaging throughout
+3. Make description, tags and hashtags also engaging and SEO-friendly
+
+OUTPUT FORMAT (Strictly valid JSON only):
+{{
+  "seo_title": [
+    "🔥 {product_name} Review 2026: खरीदने से पहले ये वीडियो ज़रूर देखो!",
+    "{product_name} - मत खरीदो जब तक ये Review ना देख लो | Real Test",
+    "सिर्फ {price} में इतना कुछ? {product_name} Full Honest Review"
+  ],
+  "video_script": "Complete script in pure Devanagari Hindi starting with a powerful unique hook",
+  "seo_description": "SEO optimized engaging description",
+  "tags": ["tag1", "tag2", "tag3"],
+  "hashtags": "#hashtag1 #hashtag2 #hashtag3"
+}}
+"""
+
+    # Step 1: Gemini — 3 KEY ROTATION
+    for key_label, gclient in GEMINI_CLIENTS:
+        for attempt in range(1, max_retries + 1):
+            try:
+                print(f"🔄 AI Attempt {attempt}/{max_retries} with gemini-3.6-flash ({key_label})...")
+
+                response = gclient.chat.completions.create(
+                    model="gemini-3.6-flash",
+                    messages=[{"role": "user", "content": base_prompt}],
+                    temperature=0.85
+                )
+
+                json_data = _parse_ai_json(response.choices[0].message.content.strip())
+
+                if json_data and "video_script" in json_data:
+                    print(f"✅ Successfully generated with {key_label} (gemini-3.6-flash)")
+                    return json_data
+
+            except Exception as e:
+                print(f"⚠️ Attempt {attempt} with {key_label} (gemini-3.6-flash) failed: {e}")
+                time.sleep(1.5)
+
+        print(f"➡️ {key_label} fail ho gayi, agli key try kar rahe hain (agar available ho)...")
+        notify_telegram(f"⚠️ Gemini {key_label} fail ho gayi, agli key try ho rahi hai...")
+
+    # Step 2: Fallback model (free client, no key) — gpt-4o-mini
+    print("🧠 Trying model: gpt-4o-mini (Fallback)")
+    for attempt in range(1, max_retries + 1):
+        try:
+            print(f"🔄 AI Attempt {attempt}/{max_retries} with gpt-4o-mini...")
+            response = fallback_client.chat.completions.create(
+                model="gpt-4o-mini",
+                messages=[{"role": "user", "content": base_prompt}],
+                temperature=0.85
+            )
+            json_data = _parse_ai_json(response.choices[0].message.content.strip())
+            if json_data and "video_script" in json_data:
+                print("✅ Successfully generated with gpt-4o-mini")
+                return json_data
+        except Exception as e:
+            print(f"⚠️ Attempt {attempt} with gpt-4o-mini failed: {e}")
+            time.sleep(1.5)
+
+    print("❌ All AI models failed. Using emergency fallback data...")
+    notify_telegram("❌ Script generation fail ho gaya (Gemini 3 keys + gpt-4o-mini dono fail), emergency fallback text use ho raha hai.")
+    return {
+        "seo_title": [
+            f"🔥 {product_name} Review 2026: खरीदने से पहले ये वीडियो ज़रूर देखो!",
+            f"{product_name} - मत खरीदो जब तक ये Review ना देख लो | Real Test",
+            f"सिर्फ {price} में इतना कुछ? {product_name} Full Honest Review"
+        ],
+        "video_script": f"क्या आपको भी {product_name} खरीदने से पहले डर लगता है कि पैसा बर्बाद हो जाएगा? आज के वीडियो में हम इसकी पूरी सच्चाई खोलकर रख देंगे। कीमत, बैटरी, साउंड क्वालिटी और असली रिव्यू — सब कुछ बिना किसी लापरवाही के।",
+        "seo_description": f"Complete honest review of {product_name}. Price, features, pros & cons. Watch before you buy!",
+        "tags": ["Tech Review", product_name, "Honest Review", "2026"],
+        "hashtags": f"#TechReview #{product_name.replace(' ', '')} #HonestReview #TechGlowIndia"
     }
-    try:
-        res = session.get(url, timeout=20)
-        soup = BeautifulSoup(res.content, "html.parser")
-        page_text = soup.get_text(" ", strip=True)
 
-        h1 = soup.find("h1")
-        title = h1.get_text(strip=True) if h1 else ""
-        if not title:
-            og_title = soup.find("meta", {"property": "og:title"})
-            title = og_title.get("content", "") if og_title else ""
-        title = re.sub(r"\s*Review\s*\(\d{4}\)\s*$", "", title, flags=re.I).strip()
-        data["title"] = title[:80] or "Trending Product Deal"
-
-        cat_match = re.search(r"([\w &]{2,25}?)\s*✓\s*Verified Expert Review", page_text)
-        if cat_match:
-            data["category"] = cat_match.group(1).strip()
-
-        price_match = re.search(r"Current Best Deal Price[^\d₹]*₹\s*([\d,]+)", page_text)
-        if price_match:
-            data["price"] = f"₹{price_match.group(1)}"
-            data["has_real_price"] = True
-
-        image_urls = []
-        for img in soup.find_all("img"):
-            src = img.get("src") or img.get("data-src") or ""
-            if any(cdn in src for cdn in ["flixcart.com", "media-amazon.com"]) and not any(
-                bad in src.lower() for bad in ["logo", "icon", "sprite"]
-            ):
-                clean_src = src.split("?")[0]
-                if clean_src not in image_urls:
-                    image_urls.append(clean_src)
-        if not image_urls:
-            og_image = soup.find("meta", {"property": "og:image"})
-            if og_image and og_image.get("content"):
-                image_urls = [og_image["content"]]
-        if not image_urls:
-            image_urls = [DEFAULT_FALLBACK_IMAGE]
-
-        final_5 = []
-        while len(final_5) < 5 and image_urls:
-            for link in image_urls:
-                final_5.append(link)
-                if len(final_5) == 5:
-                    break
-        data["image"] = final_5[0]
-        data["extra_images"] = final_5[:5]
-
-        pros_heading = soup.find(string=re.compile(r"What We Like", re.I))
-        if pros_heading:
-            pros_list = pros_heading.find_parent().find_next("ul")
-            if pros_list:
-                for li in pros_list.find_all("li")[:5]:
-                    txt = li.get_text(strip=True).lstrip("✓✔-• ").strip()
-                    if txt:
-                        data["features"].append(txt)
-
-        logging.info(f"✅ BG-TechLab Page Extracted: {data['title']} | Category: {data['category'] or 'N/A'} | Price: {data['price']}")
-    except Exception as e:
-        logging.error(f"⚠️ BG-TechLab Scraping Error: {e}")
-    return data
-
-def scrape_product_details(url):
-    logging.info(f"🔄 Fetching Real Product Data & Multiple Images: {url[:60]}...")
-    session = requests.Session()
-    session.headers.update({
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
-    })
-
-    if "github.io" in url:
-        return scrape_bgtechlab_page(url, session)
-
-    data = {
-        "title": "",
-        "category": "",
-        "price": "Special Offer",
-        "has_real_price": False,
-        "image": "",
-        "extra_images": [],
-        "features": []
-    }
-    res_url = unshorten_amazon_url(url, session)
-    try:
-        res = session.get(res_url, allow_redirects=True, timeout=20)
-        soup = BeautifulSoup(res.content, "html.parser")
-
-        title_elem = (
-            soup.find("span", {"class": "VU-Tz5"}) 
-            or soup.find("span", {"class": "B_NuCI"})
-            or soup.find("h1", {"class": "_6ER3B5"})
-            or soup.find("span", {"id": "productTitle"}) 
-            or soup.find("h1", {"id": "title"})
-            or soup.find("meta", {"property": "og:title"})
-        )
-        if title_elem:
-            raw_title = title_elem.get("content") if title_elem.name == "meta" else title_elem.get_text()
-            clean_title = raw_title.strip().replace("\n", " ")
-            clean_title = re.sub(r"\s*:\s*(Amazon|Flipkart|Buy Online)\..*$", "", clean_title, flags=re.IGNORECASE)
-            data["title"] = clean_title[:70].rstrip()
-
-        if not data["title"]:
-            match = re.search(r'flipkart\.com/([^/]+)/p/', res_url)
-            if match:
-                data["title"] = match.group(1).replace("-", " ").title()
-
-        feature_elems = soup.find_all(["li", "div"], {"class": re.compile(r'(feature|bullet|description|_2416B)', re.I)})
-        for fe in feature_elems[:4]:
-            txt = fe.get_text().strip()
-            if 15 < len(txt) < 120 and not any(x in txt.lower() for x in ["return", "delivery", "warranty", "cash on"]):
-                data["features"].append(txt)
-
-        image_urls = []
-        all_imgs = soup.find_all("img", {"src": re.compile(r'rukminim[0-9]\.flixcart\.com')})
-        for img in all_imgs:
-            src = img.get('src') or img.get('data-src') or ""
-            if src and not any(bad in src.lower() for bad in ["logo", "svg", "icon", "placeholder", "header"]):
-                high_res = re.sub(r'/(?:\d+)/(?:\d+)/', '/832/832/', src)
-                if high_res not in image_urls:
-                    image_urls.append(high_res)
-
-        if not image_urls:
-            amz_imgs = soup.find_all("img", {"src": re.compile(r'm\.media-amazon\.com/images/I/')})
-            for img in amz_imgs:
-                src = img.get('src', '')
-                if not any(bad in src.lower() for bad in ["logo", "icon", "sprite"]):
-                    high_res = re.sub(r'\._AC_.*_\.', '.', src)
-                    if high_res not in image_urls:
-                        image_urls.append(high_res)
-
-        if len(image_urls) == 0:
-            image_urls = [DEFAULT_FALLBACK_IMAGE]
-
-        final_5_images = []
-        while len(final_5_images) < 5:
-            for img_link in image_urls:
-                final_5_images.append(img_link)
-                if len(final_5_images) == 5:
-                    break
-        data["image"] = final_5_images[0]
-        data["extra_images"] = final_5_images[:5]
-
-        price_elem = soup.find("div", {"class": "Nx9bqj CxhGGd"}) or soup.find("span", {"class": "a-price-whole"})
-        if price_elem:
-            clean_price = re.sub(r"[^\d]", "", price_elem.get_text())
-            if clean_price: 
-                data["price"] = f"₹{clean_price}"
-                data["has_real_price"] = True
-    except Exception as e:
-        logging.error(f"⚠️ Scraping Error: {e}")
-
-    if not data["title"]:
-        data["title"] = "Trending Gadget Deal"
-    logging.info(f"✅ Product Extracted: {data['title']} | Price: {data['price']}")
-    logging.info(f"🖼️ Images Prepared ({len(data['extra_images'])} images)")
-    return data
-
-# ================= 4. SCRIPT GENERATOR =================
-def generate_reel_script(product_data):
-    logging.info("🤖 Generating Script in Roman English / Hinglish Script (Target: 45 Seconds)...")
-    
-    title = product_data["title"]
-    price = product_data["price"]
-    category = product_data.get("category", "") or "product"
-    category_tag = re.sub(r'\W+', '', category) or "deals"
-    features_str = " | ".join(product_data["features"]) if product_data["features"] else f"Great quality {category}, trusted brand, best value for money"
-
-    prompt = f"""
-    You are an expert viral Instagram Reel creator. Write a detailed, engaging 45 SECONDS long script in ROMAN ENGLISH / HINGLISH (English alphabets only) for:
-    PRODUCT CATEGORY: {category}
-    PRODUCT: {title}
-    PRICE: {price}
-    KEY FEATURES / PROS: {features_str}
-    STRICT RULES:
-    1. STRICT DURATION: The script MUST be 100 to 110 words long so speaking duration is EXACTLY 45 SECONDS!
-    2. SCRIPT LANGUAGE: Use ONLY Roman English / Hinglish script. Do NOT use Devanagari Hindi text!
-    3. NO GREETINGS: ABSOLUTELY NO 'Hello Guys', 'Namaskar', 'Hey Friends'.
-    4. Start IMMEDIATELY with a strong hook question in Hinglish.
-    5. Cover the actual KEY FEATURES / PROS listed above.
-    6. NO EMOJIS in hook_text, key_feature, or cta_text!
-    Return STRICTLY VALID JSON format:
-    {{
-        "script": "...",
-        "caption": "🔥 {title} Deal! Check link in description #deals #{category_tag}",
-        "hook_text": "VIRAL DEAL ALERT!",
-        "key_feature": "Best Price: {price}",
-        "cta_text": "Link in Description!"
-    }}
-    """
-    try:
-        res = client.chat.completions.create(
-            model="gpt-4o-mini",
-            messages=[{"role": "user", "content": prompt}]
-        )
-        raw_text = res.choices[0].message.content.strip()
-        clean_json = re.sub(r'^```json\s*|\s*```$', '', raw_text, flags=re.MULTILINE)
-        return json.loads(clean_json)
-    except Exception as e:
-        logging.error(f"⚠️ AI Script Error: {e}")
-        notify_telegram(f"⚠️ AI script generation fail ho gayi, fallback script use ho raha hai.\n<code>{e}</code>")
-        return {
-            "script": f"Kya aap ek behtareen {category} dhoond rahe hain jisme achhi quality bhi ho aur price bhi sahi ho? Pesh hai {title}! Isme aapko milta hai {features_str}. Yeh dikhne me kafi premium hai aur use karna bhi bahut aasan hai. Is time is par bahut bada price drop offer chal raha hai. Aaj hi is special deal ka fayda uthane ke liye niche description me diye gaye link par visit karein aur apna order place karein!",
-            "caption": f"Best Deal on {title}! Check link in description. #deals #{category_tag}",
-            "hook_text": "VIRAL DEAL ALERT!",
-            "key_feature": f"Best Price: {price}",
-            "cta_text": "Link in Description!"
-        }
-
-# ================= 5. VOICE GENERATION =================
+# ==========================================
+# SMART SCRIPT SPLITTER (Strict 1000 Chars Limit)
+# ==========================================
 def split_script_into_chunks(script, max_chars=MAX_CHUNK_CHARACTERS):
-    sentences = re.split(r'([.!?|\n])', script)
+    paragraphs = [p.strip() for p in script.split('\n\n') if p.strip()]
     chunks = []
     current_chunk = ""
-    for i in range(0, len(sentences), 2):
-        sentence = sentences[i]
-        punct = sentences[i+1] if i+1 < len(sentences) else ""
-        full_sentence = sentence + punct
-        
-        if len(current_chunk) + len(full_sentence) <= max_chars:
-            current_chunk += full_sentence
+
+    for p in paragraphs:
+        if len(current_chunk) + len(p) + 2 <= max_chars:
+            current_chunk += (p + "\n\n")
         else:
             if current_chunk:
                 chunks.append(current_chunk.strip())
-            current_chunk = full_sentence
+                current_chunk = ""
+
+            if len(p) > max_chars:
+                sentences = re.split(r'([।!?\n])', p)
+                sub_chunk = ""
+                for i in range(0, len(sentences), 2):
+                    sentence = sentences[i]
+                    punct = sentences[i+1] if i+1 < len(sentences) else ""
+                    full_sentence = sentence + punct
+
+                    if len(sub_chunk) + len(full_sentence) <= max_chars:
+                        sub_chunk += full_sentence
+                    else:
+                        if sub_chunk:
+                            chunks.append(sub_chunk.strip())
+                        sub_chunk = full_sentence
+                if sub_chunk:
+                    chunks.append(sub_chunk.strip())
+            else:
+                current_chunk = p + "\n\n"
+
     if current_chunk:
         chunks.append(current_chunk.strip())
     return chunks
 
+# ==========================================
+# VOICE GENERATOR (OpenAI.fm + Edge TTS Fallback)
+# ==========================================
 def generate_fable_voice_openai_fm(text_chunk, output_path):
     try:
         url = "https://www.openai.fm/api/generate"
+
         headers = {
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/134.0.0.0 Safari/537.36",
             "Origin": "https://www.openai.fm",
             "Referer": "https://www.openai.fm/",
             "Accept": "*/*",
         }
+
         files = {
             "input": (None, text_chunk),
             "voice": (None, "fable"),
-            "prompt": (None, "Speak clearly in an energetic, natural Hinglish male speaker tone at 1.25x speed. Moderate pace, energetic deal presenter tone."),
+            "prompt": (None, "Speak clearly in a natural, friendly Indian Hindi male tone. Moderate pace, clear pronunciation."),
             "vibe": (None, "audio")
         }
-        
+
         response = requests.post(url, files=files, headers=headers, timeout=90, stream=True)
+
         if response.status_code != 200:
             params = {
                 "input": text_chunk,
                 "voice": "fable",
-                "prompt": "Speak clearly in an energetic, natural Hinglish male speaker tone."
+                "prompt": "Speak clearly in a natural, friendly Indian Hindi male tone. Moderate pace, clear pronunciation."
             }
             response = requests.get(url, params=params, headers=headers, timeout=90, stream=True)
-            
+
         response.raise_for_status()
-        
+
         content_type = response.headers.get("content-type", "").lower()
-        if not any(k in content_type for k in ["audio", "mpeg", "wav", "octet-stream"]):
+        if "audio" not in content_type and "mpeg" not in content_type and "wav" not in content_type and "octet-stream" not in content_type:
             raise Exception(f"Unexpected content-type: {content_type}")
-        
+
         with open(output_path, "wb") as f:
             for chunk in response.iter_content(chunk_size=8192):
                 if chunk:
                     f.write(chunk)
-        
-        if os.path.getsize(output_path) < 8000:
-            raise Exception("Downloaded audio too small")
-            
+
+        file_size = os.path.getsize(output_path)
+        if file_size < 8000:
+            raise Exception(f"Downloaded audio too small ({file_size} bytes) — incomplete response")
+
         return True
+
     except Exception as e:
-        logging.warning(f"⚠️ OpenAI.fm Direct API Error: {e}")
+        print(f"⚠️ OpenAI.fm Direct API Error: {e}")
         return False
 
 def generate_edge_tts_voice(text, output_audio_path):
     voice = "hi-IN-MadhurNeural"
+
     async def _save():
-        communicate = edge_tts.Communicate(text, voice, rate="+25%")
+        communicate = edge_tts.Communicate(text, voice, rate="+10%")
         await communicate.save(output_audio_path)
+
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
     loop.run_until_complete(_save())
     loop.close()
 
-def generate_voiceover(text, output_audio_path):
-    logging.info("🎙️ Generating AI Voiceover (OpenAI.fm Fable Voice + Edge-TTS Fallback)...")
-    temp_dir = os.path.join(OUTPUT_DIR, "temp_voice")
+def generate_male_voice(text, output_audio_path):
+    print("🎙️ Generating Hindi Voiceover (OpenAI.fm Fable + Edge TTS Fallback)...")
+    temp_dir = "temp_voice"
     os.makedirs(temp_dir, exist_ok=True)
+
     chunks = split_script_into_chunks(text, max_chars=MAX_CHUNK_CHARACTERS)
+    print(f"🧩 Script split into {len(chunks)} part(s) [Limit: {MAX_CHUNK_CHARACTERS} chars/part].")
+
     audio_parts = []
     fable_failed = False
 
@@ -407,594 +430,387 @@ def generate_voiceover(text, output_audio_path):
 
         if not fable_failed:
             for attempt in range(1, MAX_RETRIES + 1):
-                logging.info(f"🎙️ Generating Part {idx}/{len(chunks)} with OpenAI.fm (Attempt {attempt})...")
+                print(f"🎙️ Generating Part {idx}/{len(chunks)} ({len(chunk)} chars) with OpenAI.fm (Fable Voice) - Attempt {attempt}...")
                 if generate_fable_voice_openai_fm(chunk, part_filename):
-                    success = True
-                    break
+                    if os.path.getsize(part_filename) >= 8000:
+                        success = True
+                        break
+                    else:
+                        print(f"⚠️ Part {idx} file too small after download. Retrying...")
                 time.sleep(2)
+
             if not success:
-                logging.warning("⚠️ OpenAI.fm failed, switching to Edge-TTS Fallback.")
+                print("⚠️ OpenAI.fm voice generation failed. Falling back to Edge TTS (hi-IN-MadhurNeural).")
                 fable_failed = True
 
         if fable_failed or not success:
             try:
-                logging.info(f"🔊 Generating Part {idx}/{len(chunks)} via Edge-TTS Fallback...")
+                print(f"🔊 Generating Part {idx}/{len(chunks)} via Edge TTS Fallback...")
                 generate_edge_tts_voice(chunk, part_filename)
                 if os.path.exists(part_filename) and os.path.getsize(part_filename) >= 4000:
                     success = True
                 else:
                     raise Exception("Edge TTS ne khali/chhoti audio di")
             except Exception as e:
-                logging.warning(f"⚠️ Edge TTS Part {idx} fail ({e}). Ab gTTS try kar rahe hain...")
+                print(f"⚠️ Edge TTS Part {idx} fail ({e}). Ab gTTS (Google) try kar rahe hain...")
                 try:
                     tts = gTTS(text=chunk, lang="hi")
                     tts.save(part_filename)
                     if os.path.exists(part_filename) and os.path.getsize(part_filename) >= 4000:
                         success = True
+                        print(f"✅ Part {idx} gTTS se ban gaya.")
                     else:
                         raise Exception("gTTS ne bhi khali/chhoti audio di")
                 except Exception as e2:
-                    logging.error(f"❌ Voice part {idx} failed completely: {e2}")
-                    notify_telegram(f"❌ Awaaz (TTS) fail ho gayi — teeno tarike fail (Part {idx}).")
+                    print(f"❌ Part {idx} generation completely failed (OpenAI.fm + Edge TTS + gTTS teeno fail): {e2}")
+                    notify_telegram(f"❌ Awaaz (TTS) fail ho gayi — OpenAI.fm, Edge TTS aur gTTS teeno fail (Part {idx}).")
                     return False
+
         audio_parts.append(part_filename)
 
     if audio_parts:
+        print("🔗 Concatenating and Merging All Audio Parts sequentially...")
         list_file = os.path.join(temp_dir, "concat_list.txt")
+
         with open(list_file, "w", encoding="utf-8") as f:
             for p in audio_parts:
                 clean_p = os.path.abspath(p).replace('\\', '/')
                 f.write(f"file '{clean_p}'\n")
+
         try:
-            cmd = [
+            cmd_concat = [
                 'ffmpeg', '-f', 'concat', '-safe', '0', '-i', list_file,
-                '-af', 'atempo=1.25,loudnorm=I=-16:LRA=11:TP=-1.5',
-                '-ar', '44100', '-ac', '2', '-b:a', '128k',
-                '-c:a', 'libmp3lame', '-y', output_audio_path
+                '-af', 'loudnorm=I=-16:LRA=11:TP=-1.5',
+                '-ar', '44100',
+                '-ac', '2',
+                '-b:a', '128k',
+                '-c:a', 'libmp3lame',
+                '-write_xing', '0',
+                '-y', output_audio_path
             ]
-            subprocess.run(cmd, capture_output=True, check=True)
-            logging.info(f"🔊 Audio generated successfully: {output_audio_path}")
-            return True
+            subprocess.run(cmd_concat, capture_output=True, check=True)
+            print(f"🔊 Final Audio merged successfully: {output_audio_path}")
         except Exception as e:
-            logging.error(f"❌ Audio Concatenation Error: {e}")
+            print(f"❌ Audio Joining Error: {e}")
+            notify_telegram(f"❌ Audio joining (ffmpeg) fail ho gaya: {e}")
             return False
         finally:
             for f in audio_parts + [list_file]:
                 if os.path.exists(f):
-                    try: os.remove(f)
-                    except: pass
-    return False
+                    try:
+                        os.remove(f)
+                    except:
+                        pass
 
-# ================= 6. TEXT CARD GENERATOR =================
-def create_text_card_image(text, width=1000, height=150, bg_color=(220, 20, 50), text_color=(255, 255, 255), font_size=55, save_name="card.png"):
-    clean_txt = remove_emojis(text)
-    
-    img = Image.new("RGBA", (width, height), bg_color + (240,))
-    draw = ImageDraw.Draw(img)
-    
-    font = get_system_font(font_size)
-    bbox = draw.textbbox((0, 0), clean_txt, font=font)
-    text_w = bbox[2] - bbox[0]
-    text_h = bbox[3] - bbox[1]
-    
-    x = (width - text_w) / 2
-    y = (height - text_h) / 2
-    draw.text((x, y), clean_txt, fill=text_color, font=font)
-    
-    path = os.path.join(OUTPUT_DIR, save_name)
-    img.save(path)
-    return path
+    return os.path.exists(output_audio_path)
 
-# ================= 7. FFMPEG HELPERS =================
-def get_audio_duration(audio_path):
-    cmd = [
-        "ffprobe", "-v", "error", "-show_entries", "format=duration",
-        "-of", "default=noprint_wrappers=1:nokey=1", audio_path
-    ]
-    result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-    return float(result.stdout.strip())
+# ==========================================
+# WEBSITE RECORDER
+# ==========================================
+def record_website_video(url, output_clip_path, target_duration):
+    print(f"📹 Recording Website for {target_duration:.1f}s...")
+    temp_dir = "temp_rec"
+    os.makedirs(temp_dir, exist_ok=True)
 
-def download_temp_images(urls):
-    local_paths = []
-    headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
-    for i, url in enumerate(urls):
-        try:
-            r = requests.get(url, headers=headers, timeout=15)
-            if r.status_code == 200:
-                p = os.path.join(OUTPUT_DIR, f"temp_img_{i}.png")
-                with Image.open(io.BytesIO(r.content)) as img:
-                    img = img.convert("RGBA")
-                    canvas = Image.new("RGBA", (1020, 1020), (0, 0, 0, 0))
-                    img.thumbnail((1000, 1000))
-                    offset = ((1020 - img.width) // 2, (1020 - img.height) // 2)
-                    canvas.paste(img, offset)
-                    canvas.save(p)
-                local_paths.append(p)
-        except Exception as e:
-            logging.error(f"❌ Image Download Error: {e}")
-    return local_paths
-
-# ================= 8. REEL BUILDER =================
-def create_vertical_reel_ffmpeg(product_data, ai_data, audio_path, output_video_path):
-    logging.info("🎬 Rendering 9:16 Reel with Fixed Image Timing...")
-    local_imgs = download_temp_images(product_data["extra_images"])
-    if not local_imgs:
-        logging.error("❌ No product images found!")
-        return False
-
-    audio_dur = get_audio_duration(audio_path)
-    num_imgs = len(local_imgs)
-    per_img_dur = audio_dur / num_imgs
-
-    hook_p = create_text_card_image(ai_data["hook_text"], 1000, 160, (220, 20, 50), (255, 255, 255), 60, "hook_card.png")
-    price_tag = f"PRICE: {product_data['price']}" if product_data['has_real_price'] else ai_data['key_feature']
-    price_p = create_text_card_image(price_tag, 920, 110, (0, 180, 80), (255, 255, 255), 45, "price_card.png")
-    cta_p = create_text_card_image(ai_data["cta_text"], 980, 120, (20, 20, 20), (255, 215, 0), 45, "cta_card.png")
-
-    phrases = [p.strip() for p in re.split(r'[,.!?|।\n]', ai_data["script"]) if len(p.strip()) > 2]
-    if not phrases:
-        phrases = [ai_data["script"]]
-    sub_dur = audio_dur / len(phrases)
-
-    bg_files = glob.glob("BAground Video*") + glob.glob("baground video*") + glob.glob("background*")
-    bg_video = bg_files[0] if bg_files else None
-
-    ffmpeg_cmd_inputs = []
-    
-    if bg_video:
-        ffmpeg_cmd_inputs.extend(["-stream_loop", "-1", "-i", bg_video])
-    else:
-        ffmpeg_cmd_inputs.extend(["-f", "lavfi", "-i", f"color=c=black:s=1080x1920:d={audio_dur}"])
-
-    for img in local_imgs:
-        ffmpeg_cmd_inputs.extend(["-loop", "1", "-i", img])
-
-    ffmpeg_cmd_inputs.extend(["-i", hook_p, "-i", price_p, "-i", cta_p])
-
-    sub_paths = []
-    for i, phrase in enumerate(phrases):
-        sub_path = create_text_card_image(phrase, 960, 130, (10, 10, 10), (255, 230, 0), 40, f"sub_{i}.png")
-        sub_paths.append(sub_path)
-        ffmpeg_cmd_inputs.extend(["-i", sub_path])
-
-    ffmpeg_cmd_inputs.extend(["-i", audio_path])
-
-    bg_idx = 0
-    img_start_idx = 1
-    img_end_idx = num_imgs
-    hook_idx = img_end_idx + 1
-    price_idx = hook_idx + 1
-    cta_idx = price_idx + 1
-    sub_start_idx = cta_idx + 1
-    sub_end_idx = sub_start_idx + len(phrases) - 1
-    audio_idx = sub_end_idx + 1
-
-    fps = 25
-    filter_graph = f"[{bg_idx}:v]scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920,trim=0:{audio_dur},setpts=PTS-STARTPTS[bg];"
-
-    last_v = "bg"
-    for i in range(1, num_imgs + 1):
-        st = (i - 1) * per_img_dur
-        et = i * per_img_dur
-        frames = int(per_img_dur * fps)
-        
-        if i % 2 != 0:
-            zoom_expr = f"min(zoom+0.0015,1.25)"
-        else:
-            zoom_expr = f"max(1.25-0.0015*on,1.0)"
-        
-        next_v = f"v_img_{i}"
-        filter_graph += (
-            f"[{img_start_idx + i - 1}:v]trim=0:{per_img_dur},setpts=PTS-STARTPTS,"
-            f"scale=1020:1020,zoompan=z='{zoom_expr}':d={frames}:x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':s=1020x1020,fps={fps},setpts=PTS-STARTPTS[img_{i}];"
-            f"[{last_v}][img_{i}]overlay=(W-w)/2:(H-h)/2:enable='between(t,{st},{et})'[{next_v}];"
-        )
-        last_v = next_v
-
-    filter_graph += f"[{last_v}][{hook_idx}:v]overlay=(W-w)/2:140[v1];"
-    filter_graph += f"[v1][{price_idx}:v]overlay=(W-w)/2:1420[v2];"
-    filter_graph += f"[v2][{cta_idx}:v]overlay=(W-w)/2:1600[v3];"
-
-    curr_v = "v3"
-    for i in range(len(phrases)):
-        s_idx = sub_start_idx + i
-        st = i * sub_dur
-        et = (i + 1) * sub_dur
-        next_v = f"v_sub_{i}"
-        filter_graph += f"[{curr_v}][{s_idx}:v]overlay=(W-w)/2:1180:enable='between(t,{st},{et})'[{next_v}];"
-        curr_v = next_v
-
-    filter_graph = filter_graph.rstrip(";")
-
-    cmd = [
-        "ffmpeg", "-y",
-        *ffmpeg_cmd_inputs,
-        "-filter_complex", filter_graph,
-        "-map", f"[{curr_v}]",
-        "-map", f"{audio_idx}:a",
-        "-c:v", "libx264",
-        "-preset", "veryfast",
-        "-crf", "28",
-        "-pix_fmt", "yuv420p",
-        "-c:a", "aac",
-        "-b:a", "128k",
-        "-shortest",
-        output_video_path
+    keywords_to_highlight = [
+        "Price", "₹", "Rating", "Camera", "Battery", "Display", "Review",
+        "Pros", "Cons", "Verdict", "Buy", "Features", "Audio"
     ]
 
-    logging.info("⚡ Executing FFmpeg Pipeline with Fixed Timing...")
-    res = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-
-    if res.returncode == 0:
-        if os.path.exists(output_video_path):
-            file_size = os.path.getsize(output_video_path)
-            if file_size < 500000:
-                logging.error(f"❌ Video too small ({file_size} bytes). Rendering failed.")
-                return False
-            logging.info(f"✅ Reel Generated Successfully: {output_video_path} ({file_size/1024/1024:.2f} MB)")
-            return True
-        else:
-            logging.error("❌ Output video file not found!")
-            return False
-    else:
-        logging.error(f"❌ FFmpeg Error:\n{res.stderr}")
-        return False
-
-# ================= 9. FREE VIDEO UPLOAD =================
-def upload_video_for_direct_link(video_path):
-    logging.info("☁️ Uploading Video to Cloud for Direct Link...")
-    
-    if not os.path.exists(video_path):
-        logging.error("❌ Video file not found!")
-        return None
-    
-    file_size = os.path.getsize(video_path)
-    if file_size < 500000:
-        logging.error(f"❌ Video too small ({file_size} bytes). Not uploading.")
-        return None
-    
-    logging.info(f"📁 Video size: {file_size/1024/1024:.2f} MB")
-    
-    # FREE HOST 1: Catbox.moe (Best)
     try:
-        logging.info("📤 Uploading via Catbox.moe (Timeout: 300s)...")
-        with open(video_path, 'rb') as f:
-            data = {"reqtype": "fileupload"}
-            files = {"fileToUpload": f}
-            res = requests.post("https://catbox.moe/user/api.php", data=data, files=files, timeout=300)
-            if res.status_code == 200 and res.text.startswith("https://files.catbox.moe/"):
-                direct_url = res.text.strip()
-                logging.info(f"🔗 Direct Video URL (Catbox): {direct_url}")
-                return direct_url
-    except Exception as e:
-        logging.warning(f"⚠️ Catbox Upload Failed ({e})")
+        with sync_playwright() as p:
+            browser = p.chromium.launch(headless=True)
+            context = browser.new_context(
+                viewport={'width': 1920, 'height': 1080},
+                record_video_dir=temp_dir,
+                record_video_size={'width': 1920, 'height': 1080}
+            )
 
-    # FREE HOST 2: 0x0.st
-    try:
-        logging.info("📤 Uploading via 0x0.st (Timeout: 300s)...")
-        with open(video_path, 'rb') as f:
-            res = requests.post("https://0x0.st", files={"file": f}, timeout=300)
-            if res.status_code == 200 and res.text.startswith("http"):
-                direct_url = res.text.strip()
-                logging.info(f"🔗 Direct Video URL (0x0.st): {direct_url}")
-                return direct_url
-    except Exception as e:
-        logging.warning(f"⚠️ 0x0.st Upload Failed ({e})")
+            page = context.new_page()
+            page.goto(url, wait_until="domcontentloaded", timeout=60000)
 
-    # FREE HOST 3: Litterbox (72 hours)
-    try:
-        logging.info("📤 Uploading via Litterbox (Timeout: 300s)...")
-        with open(video_path, 'rb') as f:
-            data = {"reqtype": "fileupload", "time": "72h"}
-            files = {"fileToUpload": f}
-            res = requests.post("https://litterbox.catbox.moe/resources/internals/api.php", data=data, files=files, timeout=300)
-            if res.status_code == 200 and res.text.startswith("http"):
-                direct_url = res.text.strip()
-                logging.info(f"🔗 Direct Video URL (Litterbox): {direct_url}")
-                return direct_url
-    except Exception as e:
-        logging.warning(f"⚠️ Litterbox Upload Failed ({e})")
+            try:
+                page.wait_for_selector('h1, h2, h3, .post-body, article', timeout=30000)
+            except:
+                pass
 
-    # FREE HOST 4: Tmpfiles (Last)
-    try:
-        logging.info("📤 Uploading via Tmpfiles.org (Timeout: 300s)...")
-        with open(video_path, 'rb') as f:
-            res = requests.post("https://tmpfiles.org/api/v1/upload", files={"file": f}, timeout=300)
-            if res.status_code == 200:
-                data = res.json()
-                if data.get("status") == "success":
-                    raw_url = data["data"]["url"]
-                    direct_url = raw_url.replace("tmpfiles.org/", "tmpfiles.org/dl/")
-                    logging.info(f"🔗 Direct Video URL (Tmpfiles): {direct_url}")
-                    return direct_url
-    except Exception as e:
-        logging.error(f"❌ All free upload hosts failed: {e}")
-    
-    return None
+            page.wait_for_load_state("networkidle", timeout=30000)
+            time.sleep(3)
 
-# ================= 10. BUFFER CHANNELS + PINTEREST BOARD =================
-def get_buffer_channels():
-    url = "https://api.buffer.com"
-    headers = {
-        "Authorization": f"Bearer {BUFFER_ACCESS_TOKEN}",
-        "Content-Type": "application/json"
-    }
-    
-    org_query = """
-    query {
-      account {
-        id
-        organizations {
-          id
-          name
-        }
-      }
-    }
-    """
-    
-    try:
-        res = requests.post(url, json={"query": org_query}, headers=headers, timeout=20)
-        res_data = res.json()
-        
-        if "errors" in res_data:
-            logging.error(f"❌ Buffer GraphQL Org Error: {res_data['errors']}")
-            return []
-            
-        orgs = res_data.get("data", {}).get("account", {}).get("organizations", [])
-        if not orgs:
-            logging.error("❌ No Organization found in your Buffer Account.")
-            return []
-            
-        org_id = orgs[0]["id"]
-        logging.info(f"🏢 Found Organization: {orgs[0].get('name')} (ID: {org_id})")
-        
-        channels_query = """
-        query GetChannels($input: ChannelsInput!) {
-          channels(input: $input) {
-            id
-            service
-            name
-            metadata {
-              ... on PinterestMetadata {
-                boards {
-                  serviceId
-                  name
-                }
-              }
-            }
-          }
-        }
-        """
-        
-        variables = {
-            "input": {
-                "organizationId": org_id
-            }
-        }
-        
-        res_ch = requests.post(url, json={"query": channels_query, "variables": variables}, headers=headers, timeout=20)
-        ch_data = res_ch.json()
-        
-        if "errors" in ch_data:
-            logging.error(f"❌ Buffer Channels Error: {ch_data['errors']}")
-            return []
-            
-        channels = ch_data.get("data", {}).get("channels", [])
-        channel_details = []
-        
-        for ch in channels:
-            service = ch.get("service", "").lower()
-            board_id = None
-            
-            if service == "pinterest":
-                boards = []
-                meta = ch.get("metadata")
-                if meta and isinstance(meta, dict):
-                    boards = meta.get("boards", [])
-                if boards:
-                    board_id = boards[0].get("serviceId")
-                    logging.info(f"📌 Pinterest Board selected: {boards[0].get('name')} (ID: {board_id})")
-                else:
-                    logging.warning(f"⚠️ Pinterest channel '{ch.get('name')}' me koi board nahi mila!")
-            
-            channel_details.append({
-                "id": ch["id"],
-                "service": service,
-                "name": ch.get("name", "Unknown Channel"),
-                "board_id": board_id
-            })
-            logging.info(f"📱 Channel Found: {ch.get('name')} ({service})")
-        
-        return channel_details
-        
-    except Exception as e:
-        logging.error(f"⚠️ Buffer Profiles Exception: {e}")
-        return []
+            # Zoom set to 1.7x
+            page.evaluate("document.body.style.zoom = '1.7'")
+            time.sleep(1)
 
-# ================= 11. SEND TO BUFFER =================
-def send_to_buffer(video_url, product_data, ai_data, buy_url):
-    logging.info("🚀 Publishing Reel via Buffer GraphQL API...")
-    
-    channels = get_buffer_channels()
-    if not channels:
-        logging.error("❌ No Buffer channels found! Check your BUFFER_ACCESS_TOKEN.")
-        return
-        
-    url = "https://api.buffer.com"
-    headers = {
-        "Authorization": f"Bearer {BUFFER_ACCESS_TOKEN}",
-        "Content-Type": "application/json"
-    }
-    
-    caption_text = f"{ai_data['caption']}\n\nBuy Here: {buy_url}"
-    
-    mutation = """
-    mutation CreatePost($input: CreatePostInput!) {
-      createPost(input: $input) {
-        ... on PostActionSuccess {
-          post {
-            id
-          }
-        }
-        ... on MutationError {
-          message
-        }
-      }
-    }
-    """
-    
-    for ch in channels:
-        c_id = ch["id"]
-        service = ch["service"]
-        ch_name = ch["name"]
-        board_id = ch.get("board_id")
-        
-        metadata = {}
-        
-        if service == "instagram":
-            metadata = {
-                "instagram": {
-                    "type": "reel",
-                    "shouldShareToFeed": True
-                }
-            }
-        elif service == "facebook":
-            metadata = {
-                "facebook": {
-                    "type": "reel"
-                }
-            }
-        elif service == "pinterest":
-            if not board_id:
-                logging.error(f"❌ Skipping Pinterest ({ch_name}) — No board selected")
-                continue
-            metadata = {
-                "pinterest": {
-                    "boardServiceId": board_id,
-                    "title": product_data.get("title", "Deal")[:100]
-                }
-            }
-        elif service == "youtube":
-            metadata = {
-                "youtube": {
-                    "title": product_data.get("title", "Trending Tech Reel")[:90],
-                    "categoryId": "28"
-                }
-            }
-        elif service == "tiktok":
-            metadata = {
-                "tiktok": {
-                    "isAiGenerated": False
-                }
-            }
-        
-        variables = {
-            "input": {
-                "channelId": c_id,
-                "text": caption_text,
-                "mode": "addToQueue",
-                "schedulingType": "automatic",
-                "assets": [
-                    {
-                        "video": {
-                            "url": video_url
+            js_code = """
+            (keywords) => {
+                keywords.forEach(kw => {
+                    const regex = new RegExp(`(${kw})`, 'gi');
+                    const elements = document.querySelectorAll('p, li, span, td, h1, h2, h3, div, a, strong');
+                    elements.forEach(el => {
+                        if (el.children.length === 0 && el.innerText && regex.test(el.innerText)) {
+                            el.innerHTML = el.innerText.replace(
+                                regex,
+                                '$1'
+                            );
                         }
-                    }
-                ]
+                    });
+                });
             }
-        }
-        
-        if metadata:
-            variables["input"]["metadata"] = metadata
-        
-        try:
-            res = requests.post(url, json={"query": mutation, "variables": variables}, headers=headers, timeout=30)
-            res_json = res.json()
-            
-            if "errors" in res_json and "SchedulingType" in str(res_json):
-                variables["input"]["schedulingType"] = "notification"
-                res = requests.post(url, json={"query": mutation, "variables": variables}, headers=headers, timeout=30)
-                res_json = res.json()
-            
-            create_result = res_json.get("data", {}).get("createPost", {})
-            
-            if create_result.get("post", {}).get("id"):
-                logging.info(f"🎉 Reel Successfully Sent to {ch_name} ({service}) | Post ID: {create_result['post']['id']}")
-            elif create_result.get("message"):
-                logging.error(f"❌ Buffer Post Failed for {ch_name} ({service}): {create_result['message']}")
-            else:
-                logging.error(f"❌ Buffer Post Failed for {ch_name} ({service}): Unexpected → {res_json}")
-                
-        except Exception as e:
-            logging.error(f"⚠️ Buffer GraphQL Post Exception for {ch_name}: {e}")
+            """
+            page.evaluate(js_code, keywords_to_highlight)
+            time.sleep(1)
 
-# ================= 12. MAIN WORKFLOW =================
-async def process_and_publish(buy_url):
-    logging.info("=" * 60)
-    logging.info("🚀 STARTING MULTI-PLATFORM REEL GENERATION PROCESS (BUFFER)")
-    logging.info("=" * 60)
-    notify_telegram(f"🚀 <b>Reel banna shuru hua</b>\n🔗 {buy_url}")
+            start_time = time.time()
+            max_duration = min(target_duration, 300)
 
-    product = scrape_product_details(buy_url)
-    if not product.get("title"):
-        notify_telegram(f"❌ Product scrape fail ho gaya.\n🔗 {buy_url}")
-        return
+            page_height = page.evaluate("document.body.scrollHeight")
+            viewport_height = page.evaluate("window.innerHeight")
+            total_scroll = page_height - viewport_height
 
-    ai_data = generate_reel_script(product)
-    
-    clean_title = sanitize_filename(product["title"])
-    timestamp = int(time.time())
-    unique_filename = f"reel_{clean_title}_{timestamp}.mp4"
-    
-    audio_path = os.path.join(OUTPUT_DIR, f"voice_{timestamp}.mp3")
-    video_path = os.path.join(OUTPUT_DIR, unique_filename)
-    
-    if not generate_voiceover(ai_data["script"], audio_path):
-        notify_telegram("❌ Awaaz (voiceover) nahi ban payi, reel skip ho gaya.")
-        return
-    
-    if not create_vertical_reel_ffmpeg(product, ai_data, audio_path, video_path):
-        notify_telegram("❌ Video (ffmpeg) build fail ho gaya, reel skip ho gaya.")
-        return
-    
-    direct_mp4_link = upload_video_for_direct_link(video_path)
-    
-    if direct_mp4_link and BUFFER_ACCESS_TOKEN:
-        send_to_buffer(
-            video_url=direct_mp4_link, 
-            product_data=product, 
-            ai_data=ai_data, 
-            buy_url=buy_url
+            current_scroll = 0
+            direction = 1
+
+            while time.time() - start_time < max_duration:
+                current_scroll += direction * 2
+
+                if current_scroll > total_scroll:
+                    current_scroll = total_scroll
+                    direction = -1
+                elif current_scroll < 0:
+                    current_scroll = 0
+                    direction = 1
+
+                page.evaluate(f"window.scrollTo({{ top: {current_scroll}, behavior: 'auto' }})")
+                time.sleep(0.05)
+
+            rec_path = page.video.path()
+            context.close()
+            browser.close()
+
+            if os.path.exists(rec_path):
+                if os.path.exists(output_clip_path):
+                    os.remove(output_clip_path)
+                os.rename(rec_path, output_clip_path)
+                return True
+    except Exception as e:
+        print(f"⚠️ Recording Error: {e}")
+        return False
+
+# ==========================================
+# VIDEO CREATOR & COMPRESSOR
+# ==========================================
+def compress_video_1080p(input_path, output_path, target_size_mb=95):
+    current_size = os.path.getsize(input_path) / (1024 * 1024)
+    if current_size <= target_size_mb:
+        return ensure_1080p_16x9(input_path, output_path)
+
+    video_clip = VideoFileClip(input_path)
+    duration = video_clip.duration
+    video_clip.close()
+
+    target_bitrate = (target_size_mb * 8 * 1024 * 1024 * 0.9) / duration
+    target_bitrate_kbps = max(int(target_bitrate / 1000), 500)
+
+    temp_compressed = output_path.replace('.mp4', '_compressed.mp4')
+
+    try:
+        video = VideoFileClip(input_path)
+        video = video.resize(newsize=(1920, 1080))
+        video.write_videofile(
+            temp_compressed, fps=24, codec='libx264', audio_codec='aac',
+            bitrate=f"{target_bitrate_kbps}k", audio_bitrate='64k',
+            verbose=False, logger=None, threads=4, preset='medium'
         )
-        notify_telegram(f"✅ <b>Reel Buffer ko bhej diya gaya</b>!\n🎬 {product['title']}")
-    else:
-        logging.error("❌ Video Upload failed or Buffer Access Token missing!")
-        notify_telegram("❌ Video upload fail hua ya BUFFER_ACCESS_TOKEN missing hai.")
+        video.close()
 
-async def main():
-    print("\n" + "=" * 60)
-    print("🎬 MULTI-PLATFORM REEL GENERATOR (CONNECTED TO BUFFER)")
-    print("=" * 60 + "\n")
+        if os.path.exists(output_path):
+            os.remove(output_path)
+        os.rename(temp_compressed, output_path)
+        return output_path
+    except Exception as e:
+        print(f"⚠️ Compression error: {e}")
+        return ensure_1080p_16x9(input_path, output_path)
 
-    buy_url = os.getenv("PRODUCT_URL", "").strip()
-    if not buy_url and len(sys.argv) > 1:
-        buy_url = sys.argv[1].strip()
-    if not buy_url:
-        buy_url = input("🔗 Enter Product Link: ").strip()
-    if not buy_url:
-        print("❌ No product link provided. Exiting...")
-        notify_telegram("⚠️ Koi product link provide nahi hui.")
+def ensure_1080p_16x9(input_path, output_path):
+    try:
+        video = VideoFileClip(input_path)
+        if video.size != (1920, 1080):
+            video = video.resize(newsize=(1920, 1080))
+        video.write_videofile(
+            output_path, fps=24, codec='libx264', audio_codec='aac',
+            bitrate='2000k', audio_bitrate='128k', verbose=False, logger=None
+        )
+        video.close()
+        return output_path
+    except Exception as e:
+        return input_path
+
+def create_video(audio_path, post_url, video_title, output_video_path):
+    temp_img_path = "temp_frame_1080p.png"
+    web_clip_path = "temp_website_clip.mp4"
+    temp_video_path = output_video_path.replace('.mp4', '_temp.mp4')
+
+    try:
+        audio = AudioFileClip(audio_path)
+        duration = min(audio.duration, 300)
+        if audio.duration > 300:
+            audio = audio.subclip(0, 300)
+
+        record_success = record_website_video(post_url, web_clip_path, duration)
+
+        if record_success and os.path.exists(web_clip_path):
+            bg_video = VideoFileClip(web_clip_path)
+            if bg_video.size != (1920, 1080):
+                bg_video = bg_video.resize(newsize=(1920, 1080))
+            if bg_video.duration < duration:
+                bg_video = bg_video.loop(duration=duration)
+            else:
+                bg_video = bg_video.subclip(0, duration)
+            final_video = bg_video.set_audio(audio)
+        else:
+            img = Image.new('RGB', (1920, 1080), color=(15, 23, 42))
+            draw = ImageDraw.Draw(img)
+            draw.rectangle([(60, 50), (1860, 1030)], outline=(234, 179, 8), width=5)
+            img.save(temp_img_path)
+            final_video = ImageClip(temp_img_path).set_duration(duration).set_audio(audio)
+
+        final_video.write_videofile(
+            temp_video_path, fps=24, codec='libx264', audio_codec='aac',
+            verbose=False, logger=None
+        )
+
+        final_video.close()
+        audio.close()
+
+        compressed_path = compress_video_1080p(temp_video_path, output_video_path, target_size_mb=95)
+        if os.path.exists(temp_video_path) and temp_video_path != compressed_path:
+            os.remove(temp_video_path)
+        return True
+    except Exception as e:
+        print(f"❌ Video Error: {e}")
+        return False
+
+# ==========================================
+# YOUTUBE UPLOADER
+# ==========================================
+def upload_to_youtube(video_path, title, description, tags):
+    print("📤 Uploading to YouTube...")
+    youtube = get_youtube_service()
+    if not youtube:
+        print("⚠️ Upload Skipped.")
+        return None
+
+    tags_list = tags if isinstance(tags, list) else tags.split(',')
+    body = {
+        'snippet': {
+            'title': title[:100],
+            'description': description[:5000],
+            'tags': [t.strip() for t in tags_list[:20]],
+            'categoryId': '28'
+        },
+        'status': {
+            'privacyStatus': 'unlisted',
+            'selfDeclaredMadeForKids': False
+        }
+    }
+    try:
+        media = MediaFileUpload(video_path, chunksize=-1, resumable=True)
+        request = youtube.videos().insert(part=','.join(body.keys()), body=body, media_body=media)
+
+        response = None
+        while response is None:
+            status, response = request.next_chunk()
+        video_id = response.get('id')
+        video_url = f"https://youtu.be/{video_id}"
+        print(f"✅ Uploaded! {video_url}")
+        notify_telegram(f"✅ <b>Video ban kar YouTube pe upload ho gaya!</b>\n🎬 {title}\n🔗 {video_url}")
+        return video_url
+    except Exception as e:
+        print(f"❌ Upload Failed: {e}")
+        notify_telegram(f"❌ <b>YouTube upload fail</b> ho gaya.\n<code>{e}</code>")
+        return None
+
+# ==========================================
+# MAIN FUNCTION
+# ==========================================
+def main():
+    print("=" * 50)
+    print("🚀 TechGlow India - Tech Review Auto Bot")
+    print("=" * 50)
+
+    import sys
+    post_url = os.getenv("ARTICLE_URL", "").strip()
+    if not post_url and len(sys.argv) > 1:
+        post_url = sys.argv[1].strip()
+    if not post_url:
+        post_url = input("\n🔗 Enter Tech Review Post URL: ").strip()
+    if not post_url:
+        notify_telegram("⚠️ Koi article URL provide nahi hui.")
         return
-    
-    await process_and_publish(buy_url)
+
+    notify_telegram(f"🚀 <b>Tech review video automation shuru hua</b>\n🔗 {post_url}")
+
+    blog_title, blog_content, specs = extract_tech_review_content(post_url)
+    if not blog_content:
+        notify_telegram(f"❌ Article scrape fail/short content.\n🔗 {post_url}")
+        return
+
+    ai_data = generate_youtube_assets_tech(blog_title, blog_content, specs)
+    if not ai_data:
+        notify_telegram("❌ AI script generation fail ho gaya, video nahi banaya.")
+        return
+
+    output_dir = "bot_outputs"
+    os.makedirs(output_dir, exist_ok=True)
+
+    filename_base = re.sub(r'[^\w\s-]', '', blog_title)[:30].strip().replace(" ", "_")
+    txt_file = os.path.join(output_dir, f"{filename_base}_package.txt")
+    audio_file = os.path.join(output_dir, f"{filename_base}_audio.mp3")
+    video_file = os.path.join(output_dir, f"{filename_base}_video.mp4")
+
+    titles = ai_data.get("seo_title", [])
+    selected_title = titles[0] if isinstance(titles, list) and titles else blog_title
+
+    seo_desc = f"{ai_data.get('seo_description', '')}\n\n{ai_data.get('hashtags', '')}"
+    tags = ai_data.get("tags", [])
+
+    with open(txt_file, "w", encoding="utf-8") as f:
+        f.write("=== TECH REVIEW CONTENT PACKAGE ===\n\n")
+        f.write(f"SELECTED TITLE: {selected_title}\n\n")
+        f.write("--- SPECIFICATIONS ---\n")
+        for k, v in specs.items():
+            f.write(f"{k}: {v}\n")
+        f.write("\n--- SCRIPT ---\n")
+        f.write(f"{ai_data.get('video_script')}\n\n")
+        f.write("--- SEO DESCRIPTION ---\n")
+        f.write(f"{seo_desc}\n\n")
+
+    print(f"🎉 Package Saved: {txt_file}")
+
+    script_text = ai_data.get("video_script", "")
+    audio_ok = generate_male_voice(script_text, audio_file)
+
+    if not audio_ok or not os.path.exists(audio_file):
+        print("⚠️ Automation ruk gaya: audio nahi ban paayi.")
+        return
+
+    video_created = create_video(audio_file, post_url, selected_title, video_file)
+    if not video_created or not os.path.exists(video_file):
+        notify_telegram("❌ Video build fail ho gaya, YouTube upload skip.")
+        return
+
+    video_url = upload_to_youtube(video_file, selected_title, seo_desc, tags)
+
+    print("\n✅ Process Finished!")
+    if video_url:
+        print(f"📹 YouTube: {video_url}")
 
 if __name__ == "__main__":
     try:
-        asyncio.run(main())
-    except KeyboardInterrupt:
-        print("\n\n⚠️ Process interrupted by user. Exiting...")
+        main()
     except Exception as e:
-        print(f"\n❌ Unexpected error: {e}")
-        logging.error(f"Fatal error: {e}", exc_info=True)
+        import traceback
+        err_text = traceback.format_exc()[-2500:]
+        print(f"❌ FATAL ERROR: {e}\n{err_text}")
         notify_telegram(f"❌ <b>Automation CRASH ho gaya</b>\n<code>{e}</code>")
         raise

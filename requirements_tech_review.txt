@@ -1,0 +1,11 @@
+requests
+g4f
+edge-tts
+gTTS
+beautifulsoup4
+Pillow
+moviepy==1.0.3
+playwright
+google-auth-oauthlib
+google-auth
+google-api-python-client

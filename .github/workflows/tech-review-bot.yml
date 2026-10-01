@@ -32,14 +32,15 @@ jobs:
       - name: URL nikalo (manual input ya Telegram se)
         id: get_url
         env:
+          ARTICLE_URL_INPUT: ${{ inputs.article_url }}
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
         run: |
-          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
-            echo "article_url=${{ inputs.article_url }}" >> "$GITHUB_OUTPUT"
+          if [ "$GITHUB_EVENT_NAME" = "workflow_dispatch" ]; then
+            echo "article_url=${ARTICLE_URL_INPUT}" >> "$GITHUB_OUTPUT"
           else
             pip install requests
-            python telegram_check.py
+            python telegram_check_tech.py
           fi
 
       - name: Offset file commit karo (agar Telegram check chala ho)

@@ -724,22 +724,21 @@ def split_caption_segments(script_text, max_words=12):
 
 
 def make_product_caption_card(image_path, caption, index):
-    """Product photo card with the Hinglish caption layered over the image."""
+    """Large centered product card with readable, short Hinglish captions."""
     card_path = os.path.join("temp_product_images", f"caption_card_{index:03d}.jpg")
-    canvas = Image.new("RGB", (760, 560), (12, 18, 30))
+    canvas = Image.new("RGB", (1040, 760), (7, 12, 23))
     draw = ImageDraw.Draw(canvas)
     with Image.open(image_path) as source:
         source = source.convert("RGB")
-        source.thumbnail((720, 520), Image.Resampling.LANCZOS)
-        x = (760 - source.width) // 2
-        y = (520 - source.height) // 2
+        source.thumbnail((1000, 600), Image.Resampling.LANCZOS)
+        x = (1040 - source.width) // 2
+        y = (610 - source.height) // 2
         canvas.paste(source, (x, y))
-    # Solid dark caption strip over the lower part of the product image for legibility.
-    draw.rectangle((0, 405, 760, 560), fill=(8, 13, 24))
-    draw.rectangle((0, 405, 760, 413), fill=(45, 212, 191))
+    draw.rectangle((0, 610, 1040, 760), fill=(5, 9, 18))
+    draw.rectangle((0, 610, 1040, 618), fill=(250, 204, 21))
     try:
-        font = ImageFont.truetype("DejaVuSans.ttf", 27)
-        brand_font = ImageFont.truetype("DejaVuSans.ttf", 17)
+        font = ImageFont.truetype("DejaVuSans-Bold.ttf", 34)
+        brand_font = ImageFont.truetype("DejaVuSans.ttf", 18)
     except Exception:
         font = ImageFont.load_default()
         brand_font = ImageFont.load_default()
@@ -747,7 +746,7 @@ def make_product_caption_card(image_path, caption, index):
     lines, line = [], ""
     for word in words:
         trial = (line + " " + word).strip()
-        if draw.textbbox((0, 0), trial, font=font)[2] > 700 and line:
+        if draw.textbbox((0, 0), trial, font=font)[2] > 970 and line:
             lines.append(line)
             line = word
         else:
@@ -756,21 +755,21 @@ def make_product_caption_card(image_path, caption, index):
             break
     if line and len(lines) < 2:
         lines.append(line)
-    if len(words) > 0 and len(lines) == 2 and len(" ".join(lines).split()) < len(words):
-        lines[1] = lines[1].rstrip(" .") + "..."
-    y_text = 425 if len(lines) > 1 else 445
+    if len(words) and len(" ".join(lines).split()) < len(words) and lines:
+        lines[-1] = lines[-1].rstrip(" .") + "…"
+    y_text = 635 if len(lines) > 1 else 650
     for line_text in lines[:2]:
-        draw.text((30, y_text), line_text, fill=(255, 255, 255), font=font, stroke_width=1, stroke_fill=(0, 0, 0))
-        y_text += 38
-    draw.text((30, 530), "TECHGLOW INDIA", fill=(45, 212, 191), font=brand_font)
-    canvas.save(card_path, "JPEG", quality=90, optimize=True)
+        draw.text((35, y_text), line_text, fill=(255, 255, 255), font=font, stroke_width=1, stroke_fill=(0, 0, 0))
+        y_text += 43
+    draw.text((35, 730), "TECHGLOW INDIA", fill=(250, 204, 21), font=brand_font)
+    canvas.save(card_path, "JPEG", quality=92, optimize=True)
     return card_path
 
 
 def build_product_caption_overlays(article_url, script_text, duration):
     """Cycle article product photos with short Hinglish captions over the existing scrolling website."""
     images = extract_product_images(article_url)
-    segments = split_caption_segments(to_hinglish(script_text), max_words=12)
+    segments = split_caption_segments(to_hinglish(script_text), max_words=8)
     if not images or not segments or duration <= 0:
         return []
     weights = [max(1, len(segment.split())) for segment in segments]
@@ -784,9 +783,9 @@ def build_product_caption_overlays(article_url, script_text, duration):
         try:
             card_path = make_product_caption_card(image_path, segment, index + 1)
             clip = ImageClip(card_path).set_start(start).set_duration(segment_duration)
-            clip = clip.set_position(("right", "center"))
+            clip = clip.set_position(("center", "center"))
             if segment_duration > 0.6:
-                clip = clip.fadein(min(0.18, segment_duration / 4)).fadeout(min(0.18, segment_duration / 4))
+                clip = clip.fadein(min(0.28, segment_duration / 4)).fadeout(min(0.28, segment_duration / 4))
             overlays.append(clip)
         except Exception as e:
             print(f"ℹ️ Caption/image overlay {index + 1} skipped: {e}")

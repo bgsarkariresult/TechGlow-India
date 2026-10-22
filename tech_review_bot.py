@@ -10,12 +10,13 @@ from g4f.client import Client
 import edge_tts
 from gtts import gTTS
 from PIL import Image, ImageDraw, ImageFont
+from urllib.parse import urljoin
 
 # PATCH: Fix moviepy ANTIALIAS issue
 if not hasattr(Image, 'ANTIALIAS'):
     Image.ANTIALIAS = Image.Resampling.LANCZOS
 
-from moviepy.editor import ImageClip, AudioFileClip, VideoFileClip
+from moviepy.editor import ImageClip, AudioFileClip, VideoFileClip, CompositeVideoClip
 from playwright.sync_api import sync_playwright
 
 # Google API Imports
@@ -597,6 +598,204 @@ def record_website_video(url, output_clip_path, target_duration):
         return False
 
 # ==========================================
+# PRODUCT IMAGES + HINGLISH CAPTIONS (local processing only)
+# ==========================================
+def extract_product_images(article_url, max_images=8):
+    """Use images already on the review article; no extra AI/image API calls."""
+    image_dir = "temp_product_images"
+    os.makedirs(image_dir, exist_ok=True)
+    downloaded, seen = [], set()
+    try:
+        response = requests.get(article_url, headers={
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/122 Safari/537.36"
+        }, timeout=20)
+        response.raise_for_status()
+        soup = BeautifulSoup(response.text, "html.parser")
+        candidates = []
+        for meta in soup.find_all("meta"):
+            if meta.get("property") in ("og:image", "twitter:image") or meta.get("name") == "twitter:image":
+                value = (meta.get("content") or "").strip()
+                if value:
+                    candidates.append((value, "product review image"))
+        for tag in soup.find_all("img"):
+            raw = (tag.get("data-src") or tag.get("data-lazy-src") or tag.get("data-original") or tag.get("src") or "").strip()
+            if raw and not raw.startswith("data:"):
+                candidates.append((raw, " ".join([str(tag.get("alt", "")), str(tag.get("title", "")), raw])))
+        for raw_url, hint in candidates:
+            image_url = urljoin(article_url, raw_url)
+            if image_url in seen:
+                continue
+            seen.add(image_url)
+            if any(word in hint.lower() for word in ("logo", "avatar", "author", "profile", "icon", "favicon", "emoji", "banner-ad")):
+                continue
+            try:
+                img_response = requests.get(image_url, headers={"User-Agent": "Mozilla/5.0"}, timeout=15)
+                img_response.raise_for_status()
+                if not img_response.headers.get("content-type", "").lower().startswith("image/"):
+                    continue
+                from io import BytesIO
+                with Image.open(BytesIO(img_response.content)) as source:
+                    source = source.convert("RGB")
+                    width, height = source.size
+                    if width < 240 or height < 160 or width / max(height, 1) > 3.5:
+                        continue
+                    path = os.path.join(image_dir, f"product_{len(downloaded)+1:02d}.jpg")
+                    source.save(path, "JPEG", quality=92, optimize=True)
+                    downloaded.append(path)
+                    print(f"🖼️ Article image ready: {width}x{height}")
+                    if len(downloaded) >= max_images:
+                        break
+            except Exception as image_error:
+                print(f"ℹ️ Skipping article image: {image_error}")
+    except Exception as e:
+        print(f"ℹ️ Article images unavailable: {e}")
+    print(f"🖼️ Product images ready: {len(downloaded)}")
+    return downloaded
+
+
+_DEVANAGARI_MAP = {
+    "अ":"a","आ":"aa","इ":"i","ई":"ee","उ":"u","ऊ":"oo","ऋ":"ri","ए":"e","ऐ":"ai","ओ":"o","औ":"au",
+    "क":"k","ख":"kh","ग":"g","घ":"gh","ङ":"ng","च":"ch","छ":"chh","ज":"j","झ":"jh","ञ":"ny",
+    "ट":"t","ठ":"th","ड":"d","ढ":"dh","ण":"n","त":"t","थ":"th","द":"d","ध":"dh","न":"n",
+    "प":"p","फ":"ph","ब":"b","भ":"bh","म":"m","य":"y","र":"r","ल":"l","व":"v","श":"sh","ष":"sh","स":"s","ह":"h",
+    "क्ष":"ksh","त्र":"tr","ज्ञ":"gya","ड़":"d","ढ़":"dh","ज़":"z","फ़":"f",
+    "ा":"aa","ि":"i","ी":"ee","ु":"u","ू":"oo","ृ":"ri","े":"e","ै":"ai","ो":"o","ौ":"au",
+    "ं":"n","ँ":"n","ः":"h","़":"","्":"","।":".","॥":"."
+}
+
+
+def to_hinglish(text):
+    """Simple local Devanagari-to-Roman conversion for readable Hinglish captions."""
+    out, i = [], 0
+    consonants = set("कखगघङचछजझञटठडढणतथदधनपफबभमयरलवशषसह")
+    matras = {"ा":"aa","ि":"i","ी":"ee","ु":"u","ू":"oo","ृ":"ri","े":"e","ै":"ai","ो":"o","ौ":"au","ं":"n","ँ":"n","ः":"h","़":""}
+    independent = {k:v for k,v in _DEVANAGARI_MAP.items() if k not in matras and k not in ("्","़")}
+    while i < len(text):
+        if text.startswith("क्ष", i) or text.startswith("त्र", i) or text.startswith("ज्ञ", i):
+            token = text[i:i+3]
+            out.append(_DEVANAGARI_MAP.get(token, token))
+            i += 3
+            continue
+        ch = text[i]
+        if ch in consonants:
+            roman = _DEVANAGARI_MAP.get(ch, ch)
+            i += 1
+            vowel = "a"
+            if i < len(text) and text[i] == "्":
+                vowel = ""
+                i += 1
+            elif i < len(text) and text[i] in matras:
+                vowel = matras[text[i]]
+                i += 1
+            out.append(roman + vowel)
+            continue
+        if ch in independent:
+            out.append(independent[ch])
+        elif ch in matras:
+            out.append(matras[ch])
+        else:
+            out.append(ch)
+        i += 1
+    # Common readable spellings and spacing cleanup.
+    result = "".join(out)
+    result = re.sub(r"\s+", " ", result).strip()
+    return result
+
+
+def split_caption_segments(script_text, max_words=12):
+    """Split the narration into short caption beats; timings are mapped to audio duration."""
+    text = (script_text or "").strip()
+    if not text:
+        return []
+    sentences = [s.strip() for s in re.split(r"(?<=[।.!?])\s+|\n+", text) if s.strip()]
+    segments, current = [], []
+    for sentence in sentences:
+        words = sentence.split()
+        while words:
+            room = max_words - len(current)
+            current.extend(words[:room])
+            words = words[room:]
+            if len(current) >= max_words:
+                segments.append(" ".join(current))
+                current = []
+    if current:
+        segments.append(" ".join(current))
+    return segments or [text]
+
+
+def make_product_caption_card(image_path, caption, index):
+    """Product photo card with the Hinglish caption layered over the image."""
+    card_path = os.path.join("temp_product_images", f"caption_card_{index:03d}.jpg")
+    canvas = Image.new("RGB", (760, 560), (12, 18, 30))
+    draw = ImageDraw.Draw(canvas)
+    with Image.open(image_path) as source:
+        source = source.convert("RGB")
+        source.thumbnail((720, 520), Image.Resampling.LANCZOS)
+        x = (760 - source.width) // 2
+        y = (520 - source.height) // 2
+        canvas.paste(source, (x, y))
+    # Solid dark caption strip over the lower part of the product image for legibility.
+    draw.rectangle((0, 405, 760, 560), fill=(8, 13, 24))
+    draw.rectangle((0, 405, 760, 413), fill=(45, 212, 191))
+    try:
+        font = ImageFont.truetype("DejaVuSans.ttf", 27)
+        brand_font = ImageFont.truetype("DejaVuSans.ttf", 17)
+    except Exception:
+        font = ImageFont.load_default()
+        brand_font = ImageFont.load_default()
+    words = (caption or "").split()
+    lines, line = [], ""
+    for word in words:
+        trial = (line + " " + word).strip()
+        if draw.textbbox((0, 0), trial, font=font)[2] > 700 and line:
+            lines.append(line)
+            line = word
+        else:
+            line = trial
+        if len(lines) == 2:
+            break
+    if line and len(lines) < 2:
+        lines.append(line)
+    if len(words) > 0 and len(lines) == 2 and len(" ".join(lines).split()) < len(words):
+        lines[1] = lines[1].rstrip(" .") + "..."
+    y_text = 425 if len(lines) > 1 else 445
+    for line_text in lines[:2]:
+        draw.text((30, y_text), line_text, fill=(255, 255, 255), font=font, stroke_width=1, stroke_fill=(0, 0, 0))
+        y_text += 38
+    draw.text((30, 530), "TECHGLOW INDIA", fill=(45, 212, 191), font=brand_font)
+    canvas.save(card_path, "JPEG", quality=90, optimize=True)
+    return card_path
+
+
+def build_product_caption_overlays(article_url, script_text, duration):
+    """Cycle article product photos with short Hinglish captions over the existing scrolling website."""
+    images = extract_product_images(article_url)
+    segments = split_caption_segments(to_hinglish(script_text), max_words=12)
+    if not images or not segments or duration <= 0:
+        return []
+    weights = [max(1, len(segment.split())) for segment in segments]
+    total_weight = sum(weights)
+    overlays, start = [], 0.0
+    for index, segment in enumerate(segments):
+        segment_duration = duration * weights[index] / total_weight
+        if index == len(segments) - 1:
+            segment_duration = max(0.05, duration - start)
+        image_path = images[index % len(images)]
+        try:
+            card_path = make_product_caption_card(image_path, segment, index + 1)
+            clip = ImageClip(card_path).set_start(start).set_duration(segment_duration)
+            clip = clip.set_position(("right", "center"))
+            if segment_duration > 0.6:
+                clip = clip.fadein(min(0.18, segment_duration / 4)).fadeout(min(0.18, segment_duration / 4))
+            overlays.append(clip)
+        except Exception as e:
+            print(f"ℹ️ Caption/image overlay {index + 1} skipped: {e}")
+        start += segment_duration
+    print(f"🎬 Added {len(overlays)} product-image + Hinglish-caption scenes.")
+    return overlays
+
+
+# ==========================================
 # VIDEO CREATOR & COMPRESSOR
 # ==========================================
 def compress_video_1080p(input_path, output_path, target_size_mb=95):
@@ -645,7 +844,7 @@ def ensure_1080p_16x9(input_path, output_path):
     except Exception as e:
         return input_path
 
-def create_video(audio_path, post_url, video_title, output_video_path):
+def create_video(audio_path, post_url, video_title, output_video_path, script_text=""):
     temp_img_path = "temp_frame_1080p.png"
     web_clip_path = "temp_website_clip.mp4"
     temp_video_path = output_video_path.replace('.mp4', '_temp.mp4')
@@ -666,13 +865,22 @@ def create_video(audio_path, post_url, video_title, output_video_path):
                 bg_video = bg_video.loop(duration=duration)
             else:
                 bg_video = bg_video.subclip(0, duration)
-            final_video = bg_video.set_audio(audio)
+            base_video = bg_video
         else:
             img = Image.new('RGB', (1920, 1080), color=(15, 23, 42))
             draw = ImageDraw.Draw(img)
             draw.rectangle([(60, 50), (1860, 1030)], outline=(234, 179, 8), width=5)
             img.save(temp_img_path)
-            final_video = ImageClip(temp_img_path).set_duration(duration).set_audio(audio)
+            base_video = ImageClip(temp_img_path).set_duration(duration)
+
+        # Existing website-scroll footage stays as the background. Only add product
+        # images and Hinglish captions in the foreground; no workflow/API changes.
+        overlays = build_product_caption_overlays(post_url, script_text, duration)
+        if overlays:
+            final_video = CompositeVideoClip([base_video] + overlays, size=(1920, 1080)).set_duration(duration).set_audio(audio)
+        else:
+            print("ℹ️ No usable article product images found; keeping the original background-only edit.")
+            final_video = base_video.set_audio(audio)
 
         final_video.write_videofile(
             temp_video_path, fps=24, codec='libx264', audio_codec='aac',
@@ -794,7 +1002,7 @@ def main():
         print("⚠️ Automation ruk gaya: audio nahi ban paayi.")
         return
 
-    video_created = create_video(audio_file, post_url, selected_title, video_file)
+    video_created = create_video(audio_file, post_url, selected_title, video_file, script_text)
     if not video_created or not os.path.exists(video_file):
         notify_telegram("❌ Video build fail ho gaya, YouTube upload skip.")
         return

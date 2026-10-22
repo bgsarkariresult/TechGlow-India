@@ -478,4 +478,745 @@ def generate_male_voice(text, output_audio_path):
                         success = True
                         print(f"✅ Part {idx} gTTS se ban gaya.")
                     else:
-                        raise Exception("gTTS ne bhi 
+                        raise Exception("gTTS ne bhi khali/chhoti audio di")
+                except Exception as e2:
+                    print(f"❌ Part {idx} generation completely failed (OpenAI.fm + Edge TTS + gTTS teeno fail): {e2}")
+                    notify_telegram(f"❌ Awaaz (TTS) fail ho gayi — OpenAI.fm, Edge TTS aur gTTS teeno fail (Part {idx}).")
+                    return False
+
+        audio_parts.append(part_filename)
+
+    if audio_parts:
+        print("🔗 Concatenating and Merging All Audio Parts sequentially...")
+        list_file = os.path.join(temp_dir, "concat_list.txt")
+
+        with open(list_file, "w", encoding="utf-8") as f:
+            for p in audio_parts:
+                clean_p = os.path.abspath(p).replace('\\', '/')
+                f.write(f"file '{clean_p}'\n")
+
+        try:
+            cmd_concat = [
+                'ffmpeg', '-f', 'concat', '-safe', '0', '-i', list_file,
+                '-af', 'loudnorm=I=-16:LRA=11:TP=-1.5',
+                '-ar', '44100',
+                '-ac', '2',
+                '-b:a', '128k',
+                '-c:a', 'libmp3lame',
+                '-write_xing', '0',
+                '-y', output_audio_path
+            ]
+            subprocess.run(cmd_concat, capture_output=True, check=True)
+            print(f"🔊 Final Audio merged successfully: {output_audio_path}")
+        except Exception as e:
+            print(f"❌ Audio Joining Error: {e}")
+            notify_telegram(f"❌ Audio joining (ffmpeg) fail ho gaya: {e}")
+            return False
+        finally:
+            for f in audio_parts + [list_file]:
+                if os.path.exists(f):
+                    try:
+                        os.remove(f)
+                    except:
+                        pass
+
+    return os.path.exists(output_audio_path)
+
+# ==========================================
+# WEBSITE RECORDER
+# ==========================================
+def record_website_video(url, output_clip_path, target_duration):
+    print(f"📹 Recording Website for {target_duration:.1f}s...")
+    temp_dir = "temp_rec"
+    os.makedirs(temp_dir, exist_ok=True)
+
+    keywords_to_highlight = [
+        "Price", "₹", "Rating", "Camera", "Battery", "Display", "Review",
+        "Pros", "Cons", "Verdict", "Buy", "Features", "Audio"
+    ]
+
+    try:
+        with sync_playwright() as p:
+            browser = p.chromium.launch(headless=True)
+            context = browser.new_context(
+                viewport={'width': 1920, 'height': 1080},
+                record_video_dir=temp_dir,
+                record_video_size={'width': 1920, 'height': 1080}
+            )
+
+            page = context.new_page()
+            page.goto(url, wait_until="domcontentloaded", timeout=60000)
+
+            try:
+                page.wait_for_selector('h1, h2, h3, .post-body, article', timeout=30000)
+            except:
+                pass
+
+            page.wait_for_load_state("networkidle", timeout=30000)
+            time.sleep(3)
+
+            # Zoom set to 1.7x
+            page.evaluate("document.body.style.zoom = '1.7'")
+            time.sleep(1)
+
+            js_code = """
+            (keywords) => {
+                keywords.forEach(kw => {
+                    const regex = new RegExp(`(${kw})`, 'gi');
+                    const elements = document.querySelectorAll('p, li, span, td, h1, h2, h3, div, a, strong');
+                    elements.forEach(el => {
+                        if (el.children.length === 0 && el.innerText && regex.test(el.innerText)) {
+                            el.innerHTML = el.innerText.replace(
+                                regex,
+                                '$1'
+                            );
+                        }
+                    });
+                });
+            }
+            """
+            page.evaluate(js_code, keywords_to_highlight)
+            time.sleep(1)
+
+            start_time = time.time()
+            max_duration = min(target_duration, 300)
+
+            page_height = page.evaluate("document.body.scrollHeight")
+            viewport_height = page.evaluate("window.innerHeight")
+            total_scroll = page_height - viewport_height
+
+            current_scroll = 0
+            direction = 1
+
+            while time.time() - start_time < max_duration:
+                current_scroll += direction * 2
+
+                if current_scroll > total_scroll:
+                    current_scroll = total_scroll
+                    direction = -1
+                elif current_scroll < 0:
+                    current_scroll = 0
+                    direction = 1
+
+                page.evaluate(f"window.scrollTo({{ top: {current_scroll}, behavior: 'auto' }})")
+                time.sleep(0.05)
+
+            rec_path = page.video.path()
+            context.close()
+            browser.close()
+
+            if os.path.exists(rec_path):
+                if os.path.exists(output_clip_path):
+                    os.remove(output_clip_path)
+                os.rename(rec_path, output_clip_path)
+                return True
+    except Exception as e:
+        print(f"⚠️ Recording Error: {e}")
+        return False
+
+# ==========================================
+# PRODUCT IMAGES + HINGLISH CAPTIONS (local processing only)
+# ==========================================
+_IMG_SKIP_WORDS = ("logo", "avatar", "author", "profile", "icon", "favicon", "emoji",
+                   "banner-ad", "sprite", "placeholder", "loading", "pixel", "tracking", "badge")
+_SECTION_SKIP_WORDS = ("related", "similar", "recommend", "suggest", "also-like", "you-may",
+                       "trending", "popular", "latest", "more-posts", "sidebar", "widget",
+                       "comment", "navbar", "menu", "newsletter", "promo", "advert", "sponsor",
+                       "other-product", "compare")
+_HEADING_SKIP_RE = re.compile(
+    r"related|similar|you may also|you might also|recommended|more like|alternatives|other (products|deals)|also (buy|viewed)",
+    re.I)
+_TOKEN_STOP = {"review", "price", "specs", "specifications", "india", "full", "honest", "best",
+               "buy", "with", "and", "the", "for", "under", "test", "real", "launch", "features",
+               "hindi", "tech", "glow", "techglow", "video", "new", "latest", "top"}
+
+
+def _product_tokens(*texts):
+    tokens = set()
+    for text in texts:
+        for word in re.findall(r"[A-Za-z0-9]{3,}", text or ""):
+            w = word.lower()
+            if w not in _TOKEN_STOP and not w.isdigit():
+                tokens.add(w)
+    return tokens
+
+
+def _clean_page_for_images(soup):
+    """Related/sidebar/nav/footer wale hisse hata deta hai taaki doosre products ki images na aayein."""
+    for tag in soup(["script", "style", "noscript", "header", "footer", "nav", "aside", "form"]):
+        tag.decompose()
+    # class/id me related, sidebar, etc. likha ho
+    doomed = []
+    for el in soup.find_all(True):
+        marker = " ".join(el.get("class", []) if isinstance(el.get("class"), list) else [str(el.get("class") or "")])
+        marker = (marker + " " + str(el.get("id") or "")).lower()
+        if marker.strip() and any(w in marker for w in _SECTION_SKIP_WORDS):
+            doomed.append(el)
+    # "Related Products" jaise heading ke baad ka hissa
+    for h in soup.find_all(["h2", "h3", "h4"]):
+        if _HEADING_SKIP_RE.search(h.get_text(" ", strip=True) or ""):
+            doomed.append(h)
+            level = int(h.name[1])
+            for sib in h.find_next_siblings():
+                if sib.name in ("h1", "h2", "h3", "h4") and int(sib.name[1]) <= level:
+                    break
+                doomed.append(sib)
+    for el in doomed:
+        if not getattr(el, "decomposed", False):
+            el.decompose()
+    return soup
+
+
+def _image_hash(img):
+    small = np.asarray(img.convert("L").resize((8, 8), Image.Resampling.LANCZOS), dtype=float)
+    return "".join("1" if v > small.mean() else "0" for v in small.flatten())
+
+
+def extract_product_images(article_url, max_images=8, product_title=""):
+    """Sirf article ke apne product ki images (related/sidebar/doosre products ki nahi)."""
+    image_dir = "temp_product_images"
+    os.makedirs(image_dir, exist_ok=True)
+    chosen_paths = []
+    try:
+        from io import BytesIO
+        response = requests.get(article_url, headers={
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/122 Safari/537.36"
+        }, timeout=20)
+        response.raise_for_status()
+        soup = BeautifulSoup(response.text, "html.parser")
+
+        h1 = soup.find("h1")
+        page_title = (h1.get_text(" ", strip=True) if h1 else "") or (soup.title.get_text(" ", strip=True) if soup.title else "")
+        tokens = _product_tokens(page_title, product_title)
+        print(f"🔎 Product keywords: {sorted(tokens)[:12]}")
+
+        meta_urls = []
+        for meta in soup.find_all("meta"):
+            if meta.get("property") in ("og:image", "twitter:image") or meta.get("name") == "twitter:image":
+                value = (meta.get("content") or "").strip()
+                if value:
+                    meta_urls.append(value)
+
+        _clean_page_for_images(soup)
+        main = soup.find("div", class_="post-body") or soup.find("article") or soup.find("main") or soup.body or soup
+
+        candidates = []  # (url, hint, is_meta)
+        for tag in main.find_all("img"):
+            raw = (tag.get("data-src") or tag.get("data-lazy-src") or tag.get("data-original") or tag.get("src") or "").strip()
+            if raw and not raw.startswith("data:"):
+                hint = " ".join([str(tag.get("alt", "")), str(tag.get("title", "")), raw])
+                candidates.append((raw, hint, False))
+        for raw in meta_urls:
+            candidates.append((raw, raw, True))
+
+        seen_urls, seen_hashes, found = set(), set(), []
+        for raw_url, hint, is_meta in candidates:
+            if len(found) >= 25:
+                break
+            image_url = urljoin(article_url, raw_url)
+            if image_url in seen_urls:
+                continue
+            seen_urls.add(image_url)
+            low = hint.lower()
+            if any(word in low for word in _IMG_SKIP_WORDS):
+                print(f"   ✗ skip (logo/icon): {image_url[-60:]}")
+                continue
+            try:
+                img_response = requests.get(image_url, headers={"User-Agent": "Mozilla/5.0"}, timeout=15)
+                img_response.raise_for_status()
+                if not img_response.headers.get("content-type", "").lower().startswith("image/"):
+                    continue
+                with Image.open(BytesIO(img_response.content)) as source:
+                    img = source.convert("RGB")
+                width, height = img.size
+                ratio = width / max(height, 1)
+                if min(width, height) < 300 or ratio > 3.0 or ratio < 0.33:
+                    print(f"   ✗ skip (size {width}x{height}): {image_url[-60:]}")
+                    continue
+                h = _image_hash(img)
+                if h in seen_hashes:
+                    print(f"   ✗ skip (duplicate): {image_url[-60:]}")
+                    continue
+                seen_hashes.add(h)
+                score = sum(1 for t in tokens if t in low)
+                found.append({"img": img, "score": score, "meta": is_meta, "url": image_url})
+                print(f"   ✓ candidate (match={score}, meta={is_meta}, {width}x{height}): {image_url[-60:]}")
+            except Exception as image_error:
+                print(f"ℹ️ Skipping article image: {image_error}")
+
+        matched = [f for f in found if f["score"] > 0]
+        unmatched = [f for f in found if f["score"] == 0 and not f["meta"]]
+        if len(matched) >= 3:
+            picked = matched
+        else:
+            picked = matched + unmatched[:4]
+        if not picked:
+            picked = unmatched[:4] or found[:4]
+        picked = picked[:max_images]
+
+        for n, item in enumerate(picked, start=1):
+            p = os.path.join(image_dir, f"product_{n:02d}.jpg")
+            item["img"].save(p, "JPEG", quality=92, optimize=True)
+            chosen_paths.append(p)
+            print(f"🖼️ Using image {n}: {item['url'][-70:]}")
+    except Exception as e:
+        print(f"ℹ️ Article images unavailable: {e}")
+    print(f"🖼️ Product images ready: {len(chosen_paths)}")
+    return chosen_paths
+
+
+_DEVANAGARI_MAP = {
+    "अ":"a","आ":"aa","इ":"i","ई":"ee","उ":"u","ऊ":"oo","ऋ":"ri","ए":"e","ऐ":"ai","ओ":"o","औ":"au",
+    "क":"k","ख":"kh","ग":"g","घ":"gh","ङ":"ng","च":"ch","छ":"chh","ज":"j","झ":"jh","ञ":"ny",
+    "ट":"t","ठ":"th","ड":"d","ढ":"dh","ण":"n","त":"t","थ":"th","द":"d","ध":"dh","न":"n",
+    "प":"p","फ":"ph","ब":"b","भ":"bh","म":"m","य":"y","र":"r","ल":"l","व":"v","श":"sh","ष":"sh","स":"s","ह":"h",
+    "क्ष":"ksh","त्र":"tr","ज्ञ":"gya","ड़":"d","ढ़":"dh","ज़":"z","फ़":"f",
+    "ा":"aa","ि":"i","ी":"ee","ु":"u","ू":"oo","ृ":"ri","े":"e","ै":"ai","ो":"o","ौ":"au",
+    "ं":"n","ँ":"n","ः":"h","़":"","्":"","।":".","॥":"."
+}
+
+
+def to_hinglish(text):
+    """Simple local Devanagari-to-Roman conversion for readable Hinglish captions."""
+    out, i = [], 0
+    consonants = set("कखगघङचछजझञटठडढणतथदधनपफबभमयरलवशषसह")
+    matras = {"ा":"aa","ि":"i","ी":"ee","ु":"u","ू":"oo","ृ":"ri","े":"e","ै":"ai","ो":"o","ौ":"au","ं":"n","ँ":"n","ः":"h","़":""}
+    independent = {k:v for k,v in _DEVANAGARI_MAP.items() if k not in matras and k not in ("्","़")}
+    while i < len(text):
+        if text.startswith("क्ष", i) or text.startswith("त्र", i) or text.startswith("ज्ञ", i):
+            token = text[i:i+3]
+            out.append(_DEVANAGARI_MAP.get(token, token))
+            i += 3
+            continue
+        ch = text[i]
+        if ch in consonants:
+            roman = _DEVANAGARI_MAP.get(ch, ch)
+            i += 1
+            vowel = "a"
+            if i < len(text) and text[i] == "्":
+                vowel = ""
+                i += 1
+            elif i < len(text) and text[i] in matras:
+                vowel = matras[text[i]]
+                i += 1
+            out.append(roman + vowel)
+            continue
+        if ch in independent:
+            out.append(independent[ch])
+        elif ch in matras:
+            out.append(matras[ch])
+        else:
+            out.append(ch)
+        i += 1
+    # Common readable spellings and spacing cleanup.
+    result = "".join(out)
+    result = re.sub(r"\s+", " ", result).strip()
+    # Remove common silent final schwa so Roman captions read more naturally.
+    result = re.sub(r"([bcdfghjklmnpqrstvwxyz])a\b", r"\1", result, flags=re.I)
+    # Familiar spellings for frequent Hindi words in review scripts.
+    word_fixes = {
+        "haii": "hai", "bahuta": "bahut", "achchha": "achha",
+        "karataa": "karta", "milataa": "milta", "dikhataa": "dikhta",
+        "rahataa": "rehta", "kaafee": "kaafi", "shaanadaar": "shandaar",
+        "behatariin": "behtareen"
+    }
+    for wrong, right in word_fixes.items():
+        result = re.sub(r"\b" + wrong + r"\b", right, result, flags=re.I)
+    return result
+
+
+def split_caption_segments(script_text, max_words=12):
+    """Split the narration into short caption beats; timings are mapped to audio duration."""
+    text = (script_text or "").strip()
+    if not text:
+        return []
+    sentences = [s.strip() for s in re.split(r"(?<=[।.!?])\s+|\n+", text) if s.strip()]
+    segments, current = [], []
+    for sentence in sentences:
+        words = sentence.split()
+        while words:
+            room = max_words - len(current)
+            current.extend(words[:room])
+            words = words[room:]
+            if len(current) >= max_words:
+                segments.append(" ".join(current))
+                current = []
+    if current:
+        segments.append(" ".join(current))
+    return segments or [text]
+
+
+def _make_views(images):
+    """Har photo ke 4 'view': full, center crop, top-left crop, bottom-right crop.
+    Order: pehle sab full photos, phir crops -> repeat kam lagta hai."""
+    rounds = [[], [], [], []]
+    anchors = [None, (0.5, 0.5), (0.15, 0.15), (0.85, 0.85)]
+    for i, path in enumerate(images, start=1):
+        rounds[0].append(path)
+        try:
+            with Image.open(path) as src:
+                src = src.convert("RGB")
+                w, h = src.size
+                cw, ch = int(w * 0.7), int(h * 0.7)
+                if cw < 400 or ch < 280:
+                    continue  # chhoti image ke crop dhundhle dikhenge
+                for r in (1, 2, 3):
+                    ax, ay = anchors[r]
+                    left, top = int((w - cw) * ax), int((h - ch) * ay)
+                    p = os.path.join("temp_product_images", f"view_{i:02d}_{r}.jpg")
+                    src.crop((left, top, left + cw, top + ch)).save(p, "JPEG", quality=92)
+                    rounds[r].append(p)
+        except Exception as e:
+            print(f"ℹ️ Crop view skipped for image {i}: {e}")
+    return [p for rnd in rounds for p in rnd]
+
+
+def make_zoom_image_clip(image_path, start, duration, zoom_in=True, fade_in=0.5, fade_out=0.0):
+    """Product image apne asli size me (koi patti/blur nahi), dheere zoom in ya zoom out."""
+    with Image.open(image_path) as src:
+        src = src.convert("RGB")
+        scale = min(IMAGE_BOX[0] / src.width, IMAGE_BOX[1] / src.height, 1.6)
+        size = (max(2, int(src.width * scale)), max(2, int(src.height * scale)))
+        fitted = src.resize(size, Image.Resampling.LANCZOS)
+    base_w, base_h = fitted.size
+    z0, z1 = (1.0, IMAGE_ZOOM_END) if zoom_in else (IMAGE_ZOOM_END, 1.0)
+
+    def scale_at(t):
+        p = min(1.0, max(0.0, t / max(duration, 0.1)))
+        return z0 + (z1 - z0) * p
+
+    clip = ImageClip(np.array(fitted)).set_start(start).set_duration(duration)
+    clip = clip.add_mask()
+    clip = clip.resize(scale_at)
+    clip = clip.set_position(lambda t: (
+        FRAME_W / 2 - base_w * scale_at(t) / 2,
+        IMAGE_CENTER_Y - base_h * scale_at(t) / 2,
+    ))
+    try:
+        if fade_in > 0:
+            clip = clip.crossfadein(fade_in)
+        if fade_out > 0:
+            clip = clip.crossfadeout(fade_out)
+    except Exception:
+        if fade_in > 0:
+            clip = clip.fadein(fade_in)
+        if fade_out > 0:
+            clip = clip.fadeout(fade_out)
+    return clip
+
+
+def make_caption_box_image(text, index):
+    """Image se alag chhota caption box: kaala background, peeli border, safed text."""
+    path = os.path.join("temp_product_images", f"caption_box_{index:03d}.png")
+    try:
+        font = ImageFont.truetype("DejaVuSans-Bold.ttf", 54)
+    except Exception:
+        font = ImageFont.load_default()
+    probe = ImageDraw.Draw(Image.new("RGB", (10, 10)))
+    max_text_w = 1500
+    lines, line = [], ""
+    for word in (text or "").split():
+        trial = (line + " " + word).strip()
+        if probe.textbbox((0, 0), trial, font=font)[2] > max_text_w and line:
+            lines.append(line)
+            line = word
+        else:
+            line = trial
+    if line:
+        lines.append(line)
+    lines = lines[:2] or [""]
+    line_h = 70
+    pad_x, pad_y = 48, 24
+    text_w = max(probe.textbbox((0, 0), l, font=font)[2] for l in lines)
+    box_w, box_h = text_w + 2 * pad_x, len(lines) * line_h + 2 * pad_y
+    img = Image.new("RGBA", (box_w, box_h), (0, 0, 0, 0))
+    d = ImageDraw.Draw(img)
+    d.rounded_rectangle((0, 0, box_w - 1, box_h - 1), radius=24,
+                        fill=(5, 9, 18, 235), outline=(250, 204, 21, 255), width=5)
+    y = pad_y
+    for l in lines:
+        w = d.textbbox((0, 0), l, font=font)[2]
+        d.text(((box_w - w) / 2, y), l, fill=(255, 255, 255, 255), font=font)
+        y += line_h
+    img.save(path)
+    return path
+
+
+def build_product_caption_overlays(article_url, script_text, duration, product_title=""):
+    """Peeche website scroll (existing). Uske upar:
+       - product image (lambi der tak, dheere zoom in / zoom out, crossfade se badalti hai)
+       - sabse neeche alag Hinglish caption box (apni speed se badalta hai)"""
+    images = extract_product_images(article_url, product_title=product_title)
+    if not images or duration <= 0:
+        return []
+
+    views = _make_views(images)
+    overlays = []
+
+    # --- image scenes ---
+    n_scenes = max(1, round(duration / IMAGE_SCENE_SECONDS))
+    scene_len = duration / n_scenes
+    for k in range(n_scenes):
+        try:
+            is_last = (k == n_scenes - 1)
+            clip_len = scene_len if is_last else scene_len + CROSSFADE_SECONDS
+            overlays.append(make_zoom_image_clip(
+                views[k % len(views)], k * scene_len, clip_len, zoom_in=(k % 2 == 0),
+                fade_in=(CROSSFADE_SECONDS if k > 0 else 0.6),
+                fade_out=(0.6 if is_last else 0.0)))
+        except Exception as e:
+            print(f"ℹ️ Image scene {k + 1} skipped: {e}")
+
+    # --- Hinglish captions (AI wala Hinglish, nahi mila to purana to_hinglish) ---
+    caption_source = (HINGLISH_SCRIPT or "").strip() or to_hinglish(script_text)
+    segments = split_caption_segments(caption_source, max_words=6)
+    if segments:
+        weights = [max(1, len(s.split())) for s in segments]
+        total = sum(weights)
+        start = 0.0
+        for i, seg in enumerate(segments):
+            seg_dur = duration * weights[i] / total
+            if i == len(segments) - 1:
+                seg_dur = max(0.05, duration - start)
+            try:
+                p = make_caption_box_image(seg, i + 1)
+                c = ImageClip(p).set_start(start).set_duration(seg_dur)
+                c = c.set_position(("center", FRAME_H - CAPTION_BOTTOM_MARGIN - c.h))
+                if seg_dur > 0.5:
+                    c = c.fadein(0.12)
+                overlays.append(c)
+            except Exception as e:
+                print(f"ℹ️ Caption {i + 1} skipped: {e}")
+            start += seg_dur
+
+    print(f"🎬 Added {len(overlays)} overlay clips (zoom images + Hinglish captions).")
+    return overlays
+
+
+# ==========================================
+# VIDEO CREATOR & COMPRESSOR
+# ==========================================
+def compress_video_1080p(input_path, output_path, target_size_mb=95):
+    current_size = os.path.getsize(input_path) / (1024 * 1024)
+    if current_size <= target_size_mb:
+        return ensure_1080p_16x9(input_path, output_path)
+
+    video_clip = VideoFileClip(input_path)
+    duration = video_clip.duration
+    video_clip.close()
+
+    target_bitrate = (target_size_mb * 8 * 1024 * 1024 * 0.9) / duration
+    target_bitrate_kbps = max(int(target_bitrate / 1000), 500)
+
+    temp_compressed = output_path.replace('.mp4', '_compressed.mp4')
+
+    try:
+        video = VideoFileClip(input_path)
+        video = video.resize(newsize=(1920, 1080))
+        video.write_videofile(
+            temp_compressed, fps=24, codec='libx264', audio_codec='aac',
+            bitrate=f"{target_bitrate_kbps}k", audio_bitrate='64k',
+            verbose=False, logger=None, threads=4, preset='medium'
+        )
+        video.close()
+
+        if os.path.exists(output_path):
+            os.remove(output_path)
+        os.rename(temp_compressed, output_path)
+        return output_path
+    except Exception as e:
+        print(f"⚠️ Compression error: {e}")
+        return ensure_1080p_16x9(input_path, output_path)
+
+def ensure_1080p_16x9(input_path, output_path):
+    try:
+        video = VideoFileClip(input_path)
+        if video.size != (1920, 1080):
+            video = video.resize(newsize=(1920, 1080))
+        video.write_videofile(
+            output_path, fps=24, codec='libx264', audio_codec='aac',
+            bitrate='2000k', audio_bitrate='128k', verbose=False, logger=None
+        )
+        video.close()
+        return output_path
+    except Exception as e:
+        return input_path
+
+def create_video(audio_path, post_url, video_title, output_video_path, script_text=""):
+    temp_img_path = "temp_frame_1080p.png"
+    web_clip_path = "temp_website_clip.mp4"
+    temp_video_path = output_video_path.replace('.mp4', '_temp.mp4')
+
+    try:
+        audio = AudioFileClip(audio_path)
+        duration = min(audio.duration, 300)
+        if audio.duration > 300:
+            audio = audio.subclip(0, 300)
+
+        record_success = record_website_video(post_url, web_clip_path, duration)
+
+        if record_success and os.path.exists(web_clip_path):
+            bg_video = VideoFileClip(web_clip_path)
+            if bg_video.size != (1920, 1080):
+                bg_video = bg_video.resize(newsize=(1920, 1080))
+            if bg_video.duration < duration:
+                bg_video = bg_video.loop(duration=duration)
+            else:
+                bg_video = bg_video.subclip(0, duration)
+            base_video = bg_video
+        else:
+            img = Image.new('RGB', (1920, 1080), color=(15, 23, 42))
+            draw = ImageDraw.Draw(img)
+            draw.rectangle([(60, 50), (1860, 1030)], outline=(234, 179, 8), width=5)
+            img.save(temp_img_path)
+            base_video = ImageClip(temp_img_path).set_duration(duration)
+
+        # Existing website-scroll footage stays as the background. Only add product
+        # images and Hinglish captions in the foreground; no workflow/API changes.
+        overlays = build_product_caption_overlays(post_url, script_text, duration, video_title)
+        if overlays:
+            final_video = CompositeVideoClip([base_video] + overlays, size=(1920, 1080)).set_duration(duration).set_audio(audio)
+        else:
+            print("ℹ️ No usable article product images found; keeping the original background-only edit.")
+            final_video = base_video.set_audio(audio)
+
+        final_video.write_videofile(
+            temp_video_path, fps=24, codec='libx264', audio_codec='aac',
+            verbose=False, logger=None
+        )
+
+        final_video.close()
+        audio.close()
+
+        compressed_path = compress_video_1080p(temp_video_path, output_video_path, target_size_mb=95)
+        if os.path.exists(temp_video_path) and temp_video_path != compressed_path:
+            os.remove(temp_video_path)
+        return True
+    except Exception as e:
+        print(f"❌ Video Error: {e}")
+        return False
+
+# ==========================================
+# YOUTUBE UPLOADER
+# ==========================================
+def upload_to_youtube(video_path, title, description, tags):
+    print("📤 Uploading to YouTube...")
+    youtube = get_youtube_service()
+    if not youtube:
+        print("⚠️ Upload Skipped.")
+        return None
+
+    tags_list = tags if isinstance(tags, list) else tags.split(',')
+    body = {
+        'snippet': {
+            'title': title[:100],
+            'description': description[:5000],
+            'tags': [t.strip() for t in tags_list[:20]],
+            'categoryId': '28'
+        },
+        'status': {
+            'privacyStatus': 'unlisted',
+            'selfDeclaredMadeForKids': False
+        }
+    }
+    try:
+        media = MediaFileUpload(video_path, chunksize=-1, resumable=True)
+        request = youtube.videos().insert(part=','.join(body.keys()), body=body, media_body=media)
+
+        response = None
+        while response is None:
+            status, response = request.next_chunk()
+        video_id = response.get('id')
+        video_url = f"https://youtu.be/{video_id}"
+        print(f"✅ Uploaded! {video_url}")
+        notify_telegram(f"✅ <b>Video ban kar YouTube pe upload ho gaya!</b>\n🎬 {title}\n🔗 {video_url}")
+        return video_url
+    except Exception as e:
+        print(f"❌ Upload Failed: {e}")
+        notify_telegram(f"❌ <b>YouTube upload fail</b> ho gaya.\n<code>{e}</code>")
+        return None
+
+# ==========================================
+# MAIN FUNCTION
+# ==========================================
+def main():
+    print("=" * 50)
+    print("🚀 TechGlow India - Tech Review Auto Bot")
+    print("=" * 50)
+
+    import sys
+    post_url = os.getenv("ARTICLE_URL", "").strip()
+    if not post_url and len(sys.argv) > 1:
+        post_url = sys.argv[1].strip()
+    if not post_url:
+        post_url = input("\n🔗 Enter Tech Review Post URL: ").strip()
+    if not post_url:
+        notify_telegram("⚠️ Koi article URL provide nahi hui.")
+        return
+
+    notify_telegram(f"🚀 <b>Tech review video automation shuru hua</b>\n🔗 {post_url}")
+
+    blog_title, blog_content, specs = extract_tech_review_content(post_url)
+    if not blog_content:
+        notify_telegram(f"❌ Article scrape fail/short content.\n🔗 {post_url}")
+        return
+
+    ai_data = generate_youtube_assets_tech(blog_title, blog_content, specs)
+    if not ai_data:
+        notify_telegram("❌ AI script generation fail ho gaya, video nahi banaya.")
+        return
+
+    output_dir = "bot_outputs"
+    os.makedirs(output_dir, exist_ok=True)
+
+    filename_base = re.sub(r'[^\w\s-]', '', blog_title)[:30].strip().replace(" ", "_")
+    txt_file = os.path.join(output_dir, f"{filename_base}_package.txt")
+    audio_file = os.path.join(output_dir, f"{filename_base}_audio.mp3")
+    video_file = os.path.join(output_dir, f"{filename_base}_video.mp4")
+
+    titles = ai_data.get("seo_title", [])
+    selected_title = titles[0] if isinstance(titles, list) and titles else blog_title
+
+    seo_desc = f"{ai_data.get('seo_description', '')}\n\n{ai_data.get('hashtags', '')}"
+    tags = ai_data.get("tags", [])
+
+    with open(txt_file, "w", encoding="utf-8") as f:
+        f.write("=== TECH REVIEW CONTENT PACKAGE ===\n\n")
+        f.write(f"SELECTED TITLE: {selected_title}\n\n")
+        f.write("--- SPECIFICATIONS ---\n")
+        for k, v in specs.items():
+            f.write(f"{k}: {v}\n")
+        f.write("\n--- SCRIPT ---\n")
+        f.write(f"{ai_data.get('video_script')}\n\n")
+        f.write("--- SEO DESCRIPTION ---\n")
+        f.write(f"{seo_desc}\n\n")
+
+    print(f"🎉 Package Saved: {txt_file}")
+
+    script_text = ai_data.get("video_script", "")
+    audio_ok = generate_male_voice(script_text, audio_file)
+
+    if not audio_ok or not os.path.exists(audio_file):
+        print("⚠️ Automation ruk gaya: audio nahi ban paayi.")
+        return
+
+    video_created = create_video(audio_file, post_url, selected_title, video_file, script_text)
+    if not video_created or not os.path.exists(video_file):
+        notify_telegram("❌ Video build fail ho gaya, YouTube upload skip.")
+        return
+
+    video_url = upload_to_youtube(video_file, selected_title, seo_desc, tags)
+
+    print("\n✅ Process Finished!")
+    if video_url:
+        print(f"📹 YouTube: {video_url}")
+
+if __name__ == "__main__":
+    try:
+        main()
+    except Exception as e:
+        import traceback
+        err_text = traceback.format_exc()[-2500:]
+        print(f"❌ FATAL ERROR: {e}\n{err_text}")
+        notify_telegram(f"❌ <b>Automation CRASH ho gaya</b>\n<code>{e}</code>")
+        raise

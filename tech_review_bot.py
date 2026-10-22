@@ -600,7 +600,7 @@ def record_website_video(url, output_clip_path, target_duration):
 # ==========================================
 # PRODUCT IMAGES + HINGLISH CAPTIONS (local processing only)
 # ==========================================
-def extract_product_images(article_url, max_images=8):
+def extract_product_images(article_url, max_images=8, product_title=""):
     """Use images already on the review article; no extra AI/image API calls."""
     image_dir = "temp_product_images"
     os.makedirs(image_dir, exist_ok=True)
@@ -737,19 +737,19 @@ def split_caption_segments(script_text, max_words=12):
 def make_product_caption_card(image_path, caption, index):
     """Large centered product card with readable, short Hinglish captions."""
     card_path = os.path.join("temp_product_images", f"caption_card_{index:03d}.jpg")
-    canvas = Image.new("RGB", (1040, 760), (7, 12, 23))
+    canvas = Image.new("RGB", (1400, 920), (7, 12, 23))
     draw = ImageDraw.Draw(canvas)
     with Image.open(image_path) as source:
         source = source.convert("RGB")
-        source.thumbnail((1000, 600), Image.Resampling.LANCZOS)
-        x = (1040 - source.width) // 2
-        y = (610 - source.height) // 2
+        source.thumbnail((1360, 740), Image.Resampling.LANCZOS)
+        x = (1400 - source.width) // 2
+        y = (750 - source.height) // 2
         canvas.paste(source, (x, y))
-    draw.rectangle((0, 610, 1040, 760), fill=(5, 9, 18))
-    draw.rectangle((0, 610, 1040, 618), fill=(250, 204, 21))
+    draw.rectangle((0, 750, 1400, 920), fill=(5, 9, 18))
+    draw.rectangle((0, 750, 1400, 758), fill=(250, 204, 21))
     try:
-        font = ImageFont.truetype("DejaVuSans-Bold.ttf", 34)
-        brand_font = ImageFont.truetype("DejaVuSans.ttf", 18)
+        font = ImageFont.truetype("DejaVuSans-Bold.ttf", 38)
+        brand_font = ImageFont.truetype("DejaVuSans.ttf", 20)
     except Exception:
         font = ImageFont.load_default()
         brand_font = ImageFont.load_default()
@@ -757,7 +757,7 @@ def make_product_caption_card(image_path, caption, index):
     lines, line = [], ""
     for word in words:
         trial = (line + " " + word).strip()
-        if draw.textbbox((0, 0), trial, font=font)[2] > 970 and line:
+        if draw.textbbox((0, 0), trial, font=font)[2] > 1320 and line:
             lines.append(line)
             line = word
         else:
@@ -768,19 +768,19 @@ def make_product_caption_card(image_path, caption, index):
         lines.append(line)
     if len(words) and len(" ".join(lines).split()) < len(words) and lines:
         lines[-1] = lines[-1].rstrip(" .") + "…"
-    y_text = 635 if len(lines) > 1 else 650
+    y_text = 775 if len(lines) > 1 else 795
     for line_text in lines[:2]:
         draw.text((35, y_text), line_text, fill=(255, 255, 255), font=font, stroke_width=1, stroke_fill=(0, 0, 0))
-        y_text += 43
-    draw.text((35, 730), "TECHGLOW INDIA", fill=(250, 204, 21), font=brand_font)
+        y_text += 46
+    draw.text((35, 885), "TECHGLOW INDIA", fill=(250, 204, 21), font=brand_font)
     canvas.save(card_path, "JPEG", quality=92, optimize=True)
     return card_path
 
 
-def build_product_caption_overlays(article_url, script_text, duration):
+def build_product_caption_overlays(article_url, script_text, duration, product_title=""):
     """Cycle article product photos with short Hinglish captions over the existing scrolling website."""
-    images = extract_product_images(article_url)
-    segments = split_caption_segments(to_hinglish(script_text), max_words=8)
+    images = extract_product_images(article_url, product_title=product_title)
+    segments = split_caption_segments(to_hinglish(script_text), max_words=6)
     if not images or not segments or duration <= 0:
         return []
     weights = [max(1, len(segment.split())) for segment in segments]
@@ -795,6 +795,8 @@ def build_product_caption_overlays(article_url, script_text, duration):
             card_path = make_product_caption_card(image_path, segment, index + 1)
             clip = ImageClip(card_path).set_start(start).set_duration(segment_duration)
             clip = clip.set_position(("center", "center"))
+            zoom_amount = 0.045
+            clip = clip.resize(lambda t: 1.0 + zoom_amount * min(1.0, max(0.0, t / max(segment_duration, 0.1))))
             if segment_duration > 0.6:
                 clip = clip.fadein(min(0.28, segment_duration / 4)).fadeout(min(0.28, segment_duration / 4))
             overlays.append(clip)
@@ -885,7 +887,7 @@ def create_video(audio_path, post_url, video_title, output_video_path, script_te
 
         # Existing website-scroll footage stays as the background. Only add product
         # images and Hinglish captions in the foreground; no workflow/API changes.
-        overlays = build_product_caption_overlays(post_url, script_text, duration)
+        overlays = build_product_caption_overlays(post_url, script_text, duration, video_title)
         if overlays:
             final_video = CompositeVideoClip([base_video] + overlays, size=(1920, 1080)).set_duration(duration).set_audio(audio)
         else:

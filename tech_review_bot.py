@@ -699,6 +699,17 @@ def to_hinglish(text):
     # Common readable spellings and spacing cleanup.
     result = "".join(out)
     result = re.sub(r"\s+", " ", result).strip()
+    # Remove common silent final schwa so Roman captions read more naturally.
+    result = re.sub(r"([bcdfghjklmnpqrstvwxyz])a\b", r"\1", result, flags=re.I)
+    # Familiar spellings for frequent Hindi words in review scripts.
+    word_fixes = {
+        "haii": "hai", "bahuta": "bahut", "achchha": "achha",
+        "karataa": "karta", "milataa": "milta", "dikhataa": "dikhta",
+        "rahataa": "rehta", "kaafee": "kaafi", "shaanadaar": "shandaar",
+        "behatariin": "behtareen"
+    }
+    for wrong, right in word_fixes.items():
+        result = re.sub(r"\b" + wrong + r"\b", right, result, flags=re.I)
     return result
 
 

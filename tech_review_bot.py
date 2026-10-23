@@ -51,6 +51,19 @@ for idx, key in enumerate(GEMINI_API_KEYS, start=1):
 # Free/no-key fallback client (gpt-4o-mini ke liye)
 fallback_client = Client()
 
+# Groq — Gemini ki teeno keys fail hone par fallback
+GROQ_API_KEY = os.getenv("GROQ_API_KEY", "").strip()
+GROQ_MODELS = ["openai/gpt-oss-120b", "qwen/qwen3.8-27b"]
+GROQ_CLIENT = None
+if GROQ_API_KEY:
+    try:
+        from groq import Groq
+        GROQ_CLIENT = Groq(api_key=GROQ_API_KEY)
+    except Exception as e:
+        print(f"⚠️ Groq client nahi bana: {e}")
+else:
+    print("⚠️ GROQ_API_KEY nahi mila (Gemini fail hone par Groq fallback nahi chalega).")
+
 SCOPES = ['https://www.googleapis.com/auth/youtube.upload']
 MAX_CHUNK_CHARACTERS = 1000
 MAX_RETRIES = 3
@@ -295,7 +308,36 @@ OUTPUT FORMAT (Strictly valid JSON only):
         print(f"➡️ {key_label} fail ho gayi, agli key try kar rahe hain (agar available ho)...")
         notify_telegram(f"⚠️ Gemini {key_label} fail ho gayi, agli key try ho rahi hai...")
 
-    # Step 2: Fallback model (free client, no key) — gpt-4o-mini
+    # Step 2: Groq (Gemini ki teeno keys fail hone par)
+    if GROQ_CLIENT:
+        print("🔄 Gemini failed. Switching to Groq...")
+        notify_telegram("🔄 Gemini fail, ab Groq try ho raha hai...")
+        for g_model in GROQ_MODELS:
+            for attempt in range(1, max_retries + 1):
+                try:
+                    print(f"🔄 AI Attempt {attempt}/{max_retries} with Groq ({g_model})...")
+                    response = GROQ_CLIENT.chat.completions.create(
+                        model=g_model,
+                        messages=[{"role": "user", "content": base_prompt}],
+                        temperature=0.85,
+                        max_tokens=8192,
+                        response_format={"type": "json_object"}
+                    )
+                    json_data = _parse_ai_json(response.choices[0].message.content.strip())
+                    if json_data and "video_script" in json_data:
+                        HINGLISH_SCRIPT = json_data.get("hinglish_script", "") or ""
+                        print(f"✅ Successfully generated with Groq ({g_model})")
+                        notify_telegram(f"✅ Script Groq se ban gaya ({g_model})")
+                        return json_data
+                except Exception as e:
+                    print(f"⚠️ Attempt {attempt} with Groq ({g_model}) failed: {e}")
+                    time.sleep(1.5)
+            print(f"➡️ Groq model {g_model} fail, agla model try...")
+        notify_telegram("⚠️ Groq bhi fail, ab gpt-4o-mini try ho raha hai...")
+    else:
+        print("⚠️ Groq client nahi hai. Skipping Groq...")
+
+    # Step 3: Last fallback (free client, no key) — gpt-4o-mini
     print("🧠 Trying model: gpt-4o-mini (Fallback)")
     for attempt in range(1, max_retries + 1):
         try:
@@ -315,7 +357,7 @@ OUTPUT FORMAT (Strictly valid JSON only):
             time.sleep(1.5)
 
     print("❌ All AI models failed. Using emergency fallback data...")
-    notify_telegram("❌ Script generation fail ho gaya (Gemini 3 keys + gpt-4o-mini dono fail), emergency fallback text use ho raha hai.")
+    notify_telegram("❌ Script generation fail ho gaya (Gemini 3 keys + Groq + gpt-4o-mini teeno fail), emergency fallback text use ho raha hai.")
     return {
         "seo_title": [
             f"🔥 {product_name} Review 2026: खरीदने से पहले ये वीडियो ज़रूर देखो!",

@@ -1,5 +1,6 @@
 requests
 g4f
+groq
 edge-tts
 gTTS
 beautifulsoup4

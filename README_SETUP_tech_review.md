@@ -17,6 +17,7 @@ telegram_check.py
 | `GEMINI_API_KEY_1`         | पहली Gemini key                                          |
 | `GEMINI_API_KEY_2`         | दूसरी Gemini key                                         |
 | `GEMINI_API_KEY_3`         | तीसरी Gemini key                                         |
+| `GROQ_API_KEY`             | Groq key (तीनों Gemini fail होने पर backup)              |
 | `TELEGRAM_BOT_TOKEN`       | अपने Telegram बॉट का token                               |
 | `TELEGRAM_CHAT_ID`         | अपनी chat id                                             |
 | `YT_CLIENT_SECRETS_JSON`   | `client_secrets.json` का पूरा raw कंटेंट (जैसा है वैसा)  |

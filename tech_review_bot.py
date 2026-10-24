@@ -1142,7 +1142,7 @@ def create_video(audio_path, post_url, video_title, output_video_path, script_te
 # ==========================================
 # YOUTUBE UPLOADER
 # ==========================================
-def upload_to_youtube(video_path, title, description, tags):
+def upload_to_youtube(video_path, title, description, tags, thumbnail_path=None):
     print("📤 Uploading to YouTube...")
     youtube = get_youtube_service()
     if not youtube:
@@ -1172,7 +1172,22 @@ def upload_to_youtube(video_path, title, description, tags):
         video_id = response.get('id')
         video_url = f"https://youtu.be/{video_id}"
         print(f"✅ Uploaded! {video_url}")
-        notify_telegram(f"✅ <b>Video ban kar YouTube pe upload ho gaya!</b>\n🎬 {title}\n🔗 {video_url}")
+
+        # --- Custom Thumbnail set ---
+        if thumbnail_path and os.path.exists(thumbnail_path):
+            try:
+                youtube.thumbnails().set(
+                    videoId=video_id,
+                    media_body=MediaFileUpload(thumbnail_path)
+                ).execute()
+                print(f"✅ Custom thumbnail set: {thumbnail_path}")
+                notify_telegram(f"✅ <b>Video + Thumbnail upload ho gaya!</b>\n🎬 {title}\n🔗 {video_url}")
+            except Exception as thumb_err:
+                print(f"⚠️ Thumbnail set fail (video to upload ho gaya): {thumb_err}")
+                notify_telegram(f"✅ Video upload hua, lekin thumbnail set nahi hua.\n🔗 {video_url}")
+        else:
+            notify_telegram(f"✅ <b>Video ban kar YouTube pe upload ho gaya!</b>\n🎬 {title}\n🔗 {video_url}")
+
         return video_url
     except Exception as e:
         print(f"❌ Upload Failed: {e}")

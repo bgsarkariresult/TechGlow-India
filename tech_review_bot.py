@@ -1278,3 +1278,20 @@ if __name__ == "__main__":
         print(f"❌ FATAL ERROR: {e}\n{err_text}")
         notify_telegram(f"❌ <b>Automation CRASH ho gaya</b>\n<code>{e}</code>")
         raise
+    # ----- AI Thumbnail -----
+    thumb_file = os.path.join(output_dir, f"{filename_base}_thumb.jpg")
+    price_for_thumb = "₹2,699"
+    for k, v in specs.items():
+        if "price" in k.lower() or "₹" in str(v):
+            m = re.search(r"₹[\d,]+", str(v))
+            if m:
+                price_for_thumb = m.group()
+                break
+
+    thumb_path = generate_youtube_thumbnail(
+        product_name=blog_title,
+        price=price_for_thumb,
+        specs=specs,
+        output_path=thumb_file,
+        # reference_face_path="assets/reference_face.jpg",  # same face chahiye to uncomment
+    )

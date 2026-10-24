@@ -1263,7 +1263,7 @@ def main():
         notify_telegram("❌ Video build fail ho gaya, YouTube upload skip.")
         return
 
-    video_url = upload_to_youtube(video_file, selected_title, seo_desc, tags)
+    video_url = upload_to_youtube(video_file, selected_title, seo_desc, tags, thumbnail_path=thumb_path)
 
     print("\n✅ Process Finished!")
     if video_url:

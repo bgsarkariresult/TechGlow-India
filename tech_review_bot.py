@@ -12,6 +12,7 @@ import edge_tts
 from gtts import gTTS
 from PIL import Image, ImageDraw, ImageFont
 from urllib.parse import urljoin
+from thumbnail_gen import generate_youtube_thumbnail
 
 # PATCH: Fix moviepy ANTIALIAS issue
 if not hasattr(Image, 'ANTIALIAS'):

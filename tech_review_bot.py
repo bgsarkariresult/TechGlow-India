@@ -1251,34 +1251,7 @@ def main():
 
     print(f"🎉 Package Saved: {txt_file}")
 
-    script_text = ai_data.get("video_script", "")
-    audio_ok = generate_male_voice(script_text, audio_file)
-
-    if not audio_ok or not os.path.exists(audio_file):
-        print("⚠️ Automation ruk gaya: audio nahi ban paayi.")
-        return
-
-    video_created = create_video(audio_file, post_url, selected_title, video_file, script_text)
-    if not video_created or not os.path.exists(video_file):
-        notify_telegram("❌ Video build fail ho gaya, YouTube upload skip.")
-        return
-
-    video_url = upload_to_youtube(video_file, selected_title, seo_desc, tags, thumbnail_path=thumb_path)
-
-    print("\n✅ Process Finished!")
-    if video_url:
-        print(f"📹 YouTube: {video_url}")
-
-if __name__ == "__main__":
-    try:
-        main()
-    except Exception as e:
-        import traceback
-        err_text = traceback.format_exc()[-2500:]
-        print(f"❌ FATAL ERROR: {e}\n{err_text}")
-        notify_telegram(f"❌ <b>Automation CRASH ho gaya</b>\n<code>{e}</code>")
-        raise
-    # ----- AI Thumbnail -----
+    # ----- AI Thumbnail (Pollinations) -----
     thumb_file = os.path.join(output_dir, f"{filename_base}_thumb.jpg")
     price_for_thumb = "₹2,699"
     for k, v in specs.items():
@@ -1295,3 +1268,39 @@ if __name__ == "__main__":
         output_path=thumb_file,
         # reference_face_path="assets/reference_face.jpg",  # same face chahiye to uncomment
     )
+    if thumb_path:
+        print(f"✅ Thumbnail ready: {thumb_path}")
+    else:
+        print("⚠️ Thumbnail ban nahi paaya, video bina custom thumbnail ke upload hoga.")
+        thumb_path = None
+
+    script_text = ai_data.get("video_script", "")
+    audio_ok = generate_male_voice(script_text, audio_file)
+
+    if not audio_ok or not os.path.exists(audio_file):
+        print("⚠️ Automation ruk gaya: audio nahi ban paayi.")
+        return
+
+    video_created = create_video(audio_file, post_url, selected_title, video_file, script_text)
+    if not video_created or not os.path.exists(video_file):
+        notify_telegram("❌ Video build fail ho gaya, YouTube upload skip.")
+        return
+
+    video_url = upload_to_youtube(
+        video_file, selected_title, seo_desc, tags, thumbnail_path=thumb_path
+    )
+
+    print("\n✅ Process Finished!")
+    if video_url:
+        print(f"📹 YouTube: {video_url}")
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except Exception as e:
+        import traceback
+        err_text = traceback.format_exc()[-2500:]
+        print(f"❌ FATAL ERROR: {e}\n{err_text}")
+        notify_telegram(f"❌ <b>Automation CRASH ho gaya</b>\n<code>{e}</code>")
+        raise

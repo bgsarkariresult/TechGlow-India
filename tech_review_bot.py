@@ -1251,8 +1251,12 @@ def main():
 
     print(f"🎉 Package Saved: {txt_file}")
 
-    # ----- AI Thumbnail (Pollinations) -----
+    # ----- AI Thumbnail (Pollinations + real article product photo) -----
     thumb_file = os.path.join(output_dir, f"{filename_base}_thumb.jpg")
+    thumbnail_product_images = extract_product_images(
+        post_url, max_images=1, product_title=blog_title
+    )
+    real_product_image = thumbnail_product_images[0] if thumbnail_product_images else None
     price_for_thumb = "₹2,699"
     for k, v in specs.items():
         if "price" in k.lower() or "₹" in str(v):
@@ -1266,6 +1270,7 @@ def main():
         price=price_for_thumb,
         specs=specs,
         output_path=thumb_file,
+        product_image_path=real_product_image,
         # reference_face_path="assets/reference_face.jpg",  # same face chahiye to uncomment
     )
     if thumb_path:

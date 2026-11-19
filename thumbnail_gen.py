@@ -23,7 +23,7 @@ import time
 import random
 import requests
 from urllib.parse import quote
-from PIL import Image
+from PIL import Image, ImageDraw, ImageOps
 from io import BytesIO
 
 # ==========================================
@@ -381,6 +381,7 @@ def generate_youtube_thumbnail(
     reference_face_path: str = None,
     seed: int = None,
     max_retries: int = 3,
+    product_image_path: str = None,
 ) -> str | None:
     """
     Pollinations.ai se YouTube thumbnail generate karta hai.
@@ -445,6 +446,36 @@ def generate_youtube_thumbnail(
                 img = Image.open(BytesIO(img_data)).convert("RGB")
                 if img.size != (THUMB_WIDTH, THUMB_HEIGHT):
                     img = img.resize((THUMB_WIDTH, THUMB_HEIGHT), Image.Resampling.LANCZOS)
+
+                # Use the real product photo from the supplied article when available.
+                # Keep the generated TechGlow design, but make the actual item prominent.
+                if product_image_path and os.path.isfile(product_image_path):
+                    try:
+                        with Image.open(product_image_path) as source:
+                            product_img = ImageOps.contain(
+                                source.convert("RGB"), (340, 420), Image.Resampling.LANCZOS
+                            )
+                        card = Image.new("RGBA", (380, 460), (255, 255, 255, 250))
+                        card.alpha_composite(
+                            Image.new("RGBA", card.size, (255, 255, 255, 0))
+                        )
+                        px = (card.width - product_img.width) // 2
+                        py = (card.height - product_img.height) // 2
+                        card.paste(product_img, (px, py))
+                        x, y = THUMB_WIDTH - 410, 125
+                        shadow = Image.new("RGBA", img.size, (0, 0, 0, 0))
+                        shadow_draw = ImageDraw.Draw(shadow)
+                        shadow_draw.rounded_rectangle(
+                            (x + 8, y + 10, x + 388, y + 470),
+                            radius=24, fill=(0, 0, 0, 115)
+                        )
+                        img = Image.alpha_composite(img.convert("RGBA"), shadow)
+                        card_layer = Image.new("RGBA", img.size, (0, 0, 0, 0))
+                        card_layer.paste(card, (x, y), card)
+                        img = Image.alpha_composite(img, card_layer).convert("RGB")
+                        print(f"🖼️ Real article product photo added to thumbnail: {product_image_path}")
+                    except Exception as product_image_error:
+                        print(f"⚠️ Real product photo overlay skipped: {product_image_error}")
 
                 os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
                 img.save(output_path, "JPEG", quality=92, optimize=True)

@@ -1300,9 +1300,14 @@ def main():
         video_file, selected_title, seo_desc, tags, thumbnail_path=thumb_path
     )
 
+    if not video_url:
+        raise RuntimeError(
+            "YouTube upload failed. Check the error above; "
+            "uploadLimitExceeded means the channel's current upload limit has been reached."
+        )
+
     print("\n✅ Process Finished!")
-    if video_url:
-        print(f"📹 YouTube: {video_url}")
+    print(f"📹 YouTube: {video_url}")
 
 
 if __name__ == "__main__":

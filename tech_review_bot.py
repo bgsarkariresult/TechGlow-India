@@ -1265,7 +1265,7 @@ def main():
         price_for_thumb = ""
         for k, v in specs.items():
             if "price" in k.lower() or "₹" in str(v):
-                m = re.search(r"₹[\\d,]+", str(v))
+                m = re.search(r"₹[\d,]+", str(v))
                 if m:
                     price_for_thumb = m.group()
                     break

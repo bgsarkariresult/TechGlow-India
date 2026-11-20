@@ -349,147 +349,126 @@ PROMPT_BUILDERS = {
 }
 
 
-def build_thumbnail_prompt(
-    product_name: str,
-    price: str = "",
-    specs: dict = None,
-    category: str = None,
-) -> str:
+def build_thumbnail_prompt(product_name: str, price: str = "", specs: dict = None, category: str = None) -> str:
+    """Build a complete thumbnail brief in the channel's approved visual style."""
     specs = specs or {}
-    product = _clean_product_name(product_name)
-    price = _extract_price(price, specs)
+    product = re.sub(r"\s+", " ", str(product_name or "Product")).strip()[:90]
+    price_text = str(price or "").strip()
+    if not price_text:
+        for key, value in specs.items():
+            if "price" in str(key).lower() or "₹" in str(value):
+                match = re.search(r"₹\s?[\d,]+", str(value))
+                if match:
+                    price_text = match.group(0).replace(" ", "")
+                    break
+    facts = []
+    for key, value in specs.items():
+        value = re.sub(r"\s+", " ", str(value or "")).strip()
+        if value and len(value) <= 100 and "₹" not in value and not any(x in str(key).lower() for x in ("price", "rating")):
+            facts.append(f"{key}: {value}")
+        if len(facts) >= 5:
+            break
+    category = category or detect_category(product, specs)
+    fact_text = "\n".join(facts) if facts else "No verified specifications available."
+    price_line = f"Show exact price: {price_text}." if price_text else "Do not invent or display a price."
+    return f"""
+Create a complete, premium, highly clickable INDIAN TECH REVIEW YouTube thumbnail.
+Canvas: wide 16:9 landscape, 1280x720.
 
-    if not category:
-        category = detect_category(product_name, specs)
+VISUAL STYLE — follow this composition:
+- Photorealistic cheerful young Indian female presenter on the LEFT, waist-up, bright yellow sweater/top, excited smile, pointing toward the product with both hands.
+- Beautiful modern living-room/studio background, warm cinematic lighting, softly blurred.
+- Actual product LARGE, sharp, realistic and naturally integrated on the RIGHT. Never place it inside a small white picture-in-picture box.
+- Bold layered paint-brush banners across TOP/CENTRE in RED, YELLOW and BLACK, large high-contrast Hindi/Hinglish lettering.
+- A few circular feature badges/icons around product, subtle blue/purple neon rings near product, bold red price strip along bottom.
+- Energetic professional ad design, strong contrast, clean composition, crisp photorealism.
+- Keep face, product and text inside safe margins; readable on a phone.
 
-    builder = PROMPT_BUILDERS.get(category, build_gadget_prompt)
-    prompt = builder(product, price, specs)
+PRODUCT:
+Exact name: {product}
+Category: {category}
+Verified article facts:
+{fact_text}
+{price_line}
 
-    print(f"📂 Detected category: {category}")
-    return prompt.strip()
+PRODUCT PHOTO RULE:
+If a product photo is supplied, treat it as the visual source of truth. Recreate the SAME model, colour, shape, camera layout and proportions. Do not substitute another product. Do not paste the photo into an inset/card; integrate the product naturally into the full scene.
+
+ACCURACY:
+Use only supplied facts. Never invent battery, camera, rating, storage, warranty, performance claims or specifications. No fake ratings or unsupported feature badges.
+
+TEXT:
+Show the exact product name clearly. Use short, bold Hindi/Hinglish promotional copy based only on verified facts. If price is available, show that exact price. Use large white/yellow text with black outlines on red/yellow/black brush banners. Avoid tiny text and long paragraphs.
+
+The result must be a newly designed complete thumbnail in this style — NOT a video screenshot, NOT a blurred frame with a product photo pasted in a white rectangle, and NOT a collage.
+""".strip()
 
 
 # ==========================================
 # MAIN GENERATOR
 # ==========================================
 def generate_youtube_thumbnail(
-    product_name: str,
-    price: str = "",
-    specs: dict = None,
-    category: str = None,
-    output_path: str = "thumbnail.jpg",
-    reference_face_path: str = None,
-    seed: int = None,
-    max_retries: int = 3,
-    product_image_path: str = None,
+    product_name: str, price: str = "", specs: dict = None, category: str = None,
+    output_path: str = "thumbnail.jpg", reference_face_path: str = None,
+    seed: int = None, max_retries: int = 3, product_image_path: str = None,
 ) -> str | None:
-    """
-    Pollinations.ai se YouTube thumbnail generate karta hai.
-    Returns: saved file path ya None (fail hone par)
-    """
+    """Generate the full 16:9 thumbnail with Gemini; use the real product photo as reference."""
+    from google import genai
+    from google.genai import types
+
     prompt = build_thumbnail_prompt(product_name, price, specs, category)
-    seed = seed if seed is not None else random.randint(1, 999999)
+    api_keys = [os.getenv(f"GEMINI_API_KEY_{i}", "").strip() for i in (1, 2, 3)]
+    api_keys = [key for key in api_keys if key]
+    if not api_keys:
+        print("❌ Gemini image generation requires GEMINI_API_KEY_1 (or _2/_3) in GitHub Secrets.")
+        return None
 
-    print(f"🎨 Generating thumbnail for: {product_name}")
-    print(f"   Seed: {seed} | Size: {THUMB_WIDTH}x{THUMB_HEIGHT}")
-    print(f"   Prompt length: {len(prompt)}")
+    model = os.getenv("GEMINI_IMAGE_MODEL", "gemini-3.1-flash-image").strip()
+    models = [model]
+    if model != "gemini-2.5-flash-image":
+        models.append("gemini-2.5-flash-image")
 
-    encoded = quote(prompt)
-    classic_url = (
-        f"{CLASSIC_BASE}/{encoded}"
-        f"?width={THUMB_WIDTH}&height={THUMB_HEIGHT}"
-        f"&seed={seed}&nologo=true&enhance=true"
-    )
-    gen_url = (
-        f"{GEN_BASE}/{encoded}"
-        f"?width={THUMB_WIDTH}&height={THUMB_HEIGHT}"
-        f"&seed={seed}&nologo=true&model=flux"
-    )
-    if POLLINATIONS_API_KEY:
-        gen_url += f"&key={POLLINATIONS_API_KEY}"
-
-    urls_to_try = []
-    if POLLINATIONS_API_KEY:
-        urls_to_try.append(("gen+key", gen_url))
-    urls_to_try.append(("classic-free", classic_url))
-    if not POLLINATIONS_API_KEY:
-        urls_to_try.append(("gen-no-key", gen_url))
+    contents = [prompt]
+    if product_image_path and os.path.isfile(product_image_path):
+        try:
+            with Image.open(product_image_path) as source:
+                contents.append(source.convert("RGB").copy())
+            print("🖼️ Actual article product photo sent to Gemini as visual reference.")
+        except Exception as exc:
+            print(f"⚠️ Product reference photo could not be loaded: {exc}")
 
     last_error = None
-    for attempt in range(1, max_retries + 1):
-        for label, url in urls_to_try:
-            try:
-                print(f"🔄 Attempt {attempt}/{max_retries} via {label}...")
-                headers = {"User-Agent": "TechGlow-India-Bot/1.0"}
-                if POLLINATIONS_API_KEY and "gen.pollinations" in url:
-                    headers["Authorization"] = f"Bearer {POLLINATIONS_API_KEY}"
-
-                resp = requests.get(url, headers=headers, timeout=90, stream=True)
-
-                if resp.status_code == 402:
-                    retry_after = int(resp.headers.get("Retry-After", 50))
-                    print(f"⏳ Rate limit (402). Waiting {retry_after}s...")
-                    time.sleep(min(retry_after, 60))
-                    raise Exception("Rate limited (402)")
-
-                if resp.status_code != 200:
-                    raise Exception(f"HTTP {resp.status_code}")
-
-                content_type = resp.headers.get("content-type", "").lower()
-                if "image" not in content_type and "octet-stream" not in content_type:
-                    raise Exception(f"Not an image (content-type: {content_type})")
-
-                img_data = resp.content
-                if len(img_data) < 15000:
-                    raise Exception(f"Image too small ({len(img_data)} bytes)")
-
-                img = Image.open(BytesIO(img_data)).convert("RGB")
-                if img.size != (THUMB_WIDTH, THUMB_HEIGHT):
-                    img = img.resize((THUMB_WIDTH, THUMB_HEIGHT), Image.Resampling.LANCZOS)
-
-                # Use the real product photo from the supplied article when available.
-                # Keep the generated TechGlow design, but make the actual item prominent.
-                if product_image_path and os.path.isfile(product_image_path):
-                    try:
-                        with Image.open(product_image_path) as source:
-                            product_img = ImageOps.contain(
-                                source.convert("RGB"), (340, 420), Image.Resampling.LANCZOS
+    for model_name in models:
+        for key_no, api_key in enumerate(api_keys, 1):
+            client = genai.Client(api_key=api_key)
+            for attempt in range(1, max_retries + 1):
+                try:
+                    print(f"🎨 Gemini thumbnail: model={model_name}, key={key_no}, attempt={attempt}")
+                    response = client.models.generate_content(
+                        model=model_name,
+                        contents=contents,
+                        config=types.GenerateContentConfig(
+                            response_modalities=["IMAGE"],
+                            image_config=types.ImageConfig(aspect_ratio="16:9"),
+                        ),
+                    )
+                    for part in response.parts:
+                        if getattr(part, "inline_data", None) is not None:
+                            generated = part.as_image().convert("RGB")
+                            generated = ImageOps.fit(
+                                generated, (THUMB_WIDTH, THUMB_HEIGHT),
+                                method=Image.Resampling.LANCZOS, centering=(0.5, 0.5)
                             )
-                        card = Image.new("RGBA", (380, 460), (255, 255, 255, 250))
-                        card.alpha_composite(
-                            Image.new("RGBA", card.size, (255, 255, 255, 0))
-                        )
-                        px = (card.width - product_img.width) // 2
-                        py = (card.height - product_img.height) // 2
-                        card.paste(product_img, (px, py))
-                        x, y = THUMB_WIDTH - 410, 125
-                        shadow = Image.new("RGBA", img.size, (0, 0, 0, 0))
-                        shadow_draw = ImageDraw.Draw(shadow)
-                        shadow_draw.rounded_rectangle(
-                            (x + 8, y + 10, x + 388, y + 470),
-                            radius=24, fill=(0, 0, 0, 115)
-                        )
-                        img = Image.alpha_composite(img.convert("RGBA"), shadow)
-                        card_layer = Image.new("RGBA", img.size, (0, 0, 0, 0))
-                        card_layer.paste(card, (x, y), card)
-                        img = Image.alpha_composite(img, card_layer).convert("RGB")
-                        print(f"🖼️ Real article product photo added to thumbnail: {product_image_path}")
-                    except Exception as product_image_error:
-                        print(f"⚠️ Real product photo overlay skipped: {product_image_error}")
-
-                os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
-                img.save(output_path, "JPEG", quality=92, optimize=True)
-                print(f"✅ Thumbnail saved: {output_path} ({os.path.getsize(output_path)/1024:.0f} KB)")
-                return output_path
-
-            except Exception as e:
-                last_error = e
-                print(f"⚠️ {label} failed: {e}")
-                time.sleep(2)
-
-        time.sleep(5 + attempt * 2)
-
-    print(f"❌ Thumbnail generation failed after all retries: {last_error}")
+                            os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
+                            generated.save(output_path, "JPEG", quality=94, optimize=True)
+                            print(f"✅ Complete Gemini thumbnail saved: {output_path}")
+                            return output_path
+                    raise RuntimeError("Gemini response contained no image data.")
+                except Exception as exc:
+                    last_error = exc
+                    print(f"⚠️ Gemini image attempt failed: {exc}")
+                    time.sleep(2 + attempt)
+    print(f"❌ Gemini thumbnail generation failed: {last_error}")
     return None
 
 

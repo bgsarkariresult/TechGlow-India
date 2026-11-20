@@ -66,6 +66,8 @@ else:
     print("⚠️ GROQ_API_KEY nahi mila (Gemini fail hone par Groq fallback nahi chalega).")
 
 SCOPES = ['https://www.googleapis.com/auth/youtube.upload']
+# Custom thumbnail upload is OFF by default; enable with THUMBNAIL_UPLOAD_ENABLED=true.
+THUMBNAIL_UPLOAD_ENABLED = os.getenv('THUMBNAIL_UPLOAD_ENABLED', 'false').strip().lower() in ('1', 'true', 'yes', 'on')
 MAX_CHUNK_CHARACTERS = 1000
 MAX_RETRIES = 3
 
@@ -1174,7 +1176,7 @@ def upload_to_youtube(video_path, title, description, tags, thumbnail_path=None)
         print(f"✅ Uploaded! {video_url}")
 
         # --- Custom Thumbnail set ---
-        if thumbnail_path and os.path.exists(thumbnail_path):
+        if THUMBNAIL_UPLOAD_ENABLED and thumbnail_path and os.path.exists(thumbnail_path):
             try:
                 youtube.thumbnails().set(
                     videoId=video_id,
@@ -1251,33 +1253,36 @@ def main():
 
     print(f"🎉 Package Saved: {txt_file}")
 
-    # ----- Full AI Thumbnail (Gemini + real article product reference) -----
-    thumb_file = os.path.join(output_dir, f"{filename_base}_thumb.jpg")
-    thumbnail_product_images = extract_product_images(
-        post_url, max_images=1, product_title=blog_title
-    )
-    real_product_image = thumbnail_product_images[0] if thumbnail_product_images else None
-    price_for_thumb = ""
-    for k, v in specs.items():
-        if "price" in k.lower() or "₹" in str(v):
-            m = re.search(r"₹[\d,]+", str(v))
-            if m:
-                price_for_thumb = m.group()
-                break
+    # ----- Optional AI Thumbnail (OFF by default) -----
+    thumb_path = None
+    if THUMBNAIL_UPLOAD_ENABLED:
+        print("🟢 Custom thumbnail upload is ON; generating Gemini thumbnail...")
+        thumb_file = os.path.join(output_dir, f"{filename_base}_thumb.jpg")
+        thumbnail_product_images = extract_product_images(
+            post_url, max_images=1, product_title=blog_title
+        )
+        real_product_image = thumbnail_product_images[0] if thumbnail_product_images else None
+        price_for_thumb = ""
+        for k, v in specs.items():
+            if "price" in k.lower() or "₹" in str(v):
+                m = re.search(r"₹[\\d,]+", str(v))
+                if m:
+                    price_for_thumb = m.group()
+                    break
 
-    thumb_path = generate_youtube_thumbnail(
-        product_name=blog_title,
-        price=price_for_thumb,
-        specs=specs,
-        output_path=thumb_file,
-        product_image_path=real_product_image,
-        # reference_face_path="assets/reference_face.jpg",  # same face chahiye to uncomment
-    )
-    if thumb_path:
-        print(f"✅ Thumbnail ready: {thumb_path}")
+        thumb_path = generate_youtube_thumbnail(
+            product_name=blog_title,
+            price=price_for_thumb,
+            specs=specs,
+            output_path=thumb_file,
+            product_image_path=real_product_image,
+        )
+        if thumb_path:
+            print(f"✅ Thumbnail ready: {thumb_path}")
+        else:
+            print("⚠️ Thumbnail generation failed; video will upload without custom thumbnail.")
     else:
-        print("⚠️ Thumbnail ban nahi paaya, video bina custom thumbnail ke upload hoga.")
-        thumb_path = None
+        print("⚪ Custom thumbnail upload is OFF; skipping Gemini thumbnail generation.")
 
     script_text = ai_data.get("video_script", "")
     audio_ok = generate_male_voice(script_text, audio_file)

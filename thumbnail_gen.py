@@ -1,43 +1,61 @@
 """
-TechGlow India — AI Thumbnail Generator (Pollinations.ai)
-=========================================================
-Multi-category support: Mobiles, TV, Audio, Laptops, Printers,
-Smartwatches, Gadgets, Kitchen, Home, Accessories, Women, Men,
-Travel, Car & Motorbike, Books etc.
+TechGlow India — YouTube Thumbnail Generator (3 rotating styles)
+================================================================
+Kaam kaise karta hai:
+  1. Asli product photo se product ka cutout banta hai (white background hatakar).
+  2. Aapki face photos (assets/faces/*.png, transparent) se ek photo random chuni jaati hai.
+  3. Background: Style A me Gemini se room-scene (bina text/bina insaan), baaki styles me
+     code se banta hai. Gemini fail ho to code wala background automatically use hota hai.
+  4. Saara text (Hindi headline, price, badges) Pillow se likha jaata hai, isliye
+     spelling aur price hamesha sahi aate hain.
+
+Styles:
+  A = Banner   (red/yellow brush banners + 4 rang-birange badges, room background)
+  B = Price    (dark neon background + bada price starburst + 3 feature chips)
+  C = Honest   (diagonal rang + "HONEST REVIEW" + checklist + price ribbon)
 
 Usage:
     from thumbnail_gen import generate_youtube_thumbnail
-
-    thumb_path = generate_youtube_thumbnail(
-        product_name="ultiads TJ-54/K Tower Multimedia System",
-        price="₹6,999",
-        specs={"power": "130W", "bass": "Deep Bass", "bt": "Bluetooth", "usb": "USB/SD"},
-        category="audio",          # optional – auto-detect if not given
-        output_path="bot_outputs/thumbnail.jpg",
+    path = generate_youtube_thumbnail(
+        product_name="DREAME L50 Ultra CE Robot Vacuum and Mop",
+        price="₹64,999", specs={...}, product_image_path="photo.jpg",
+        output_path="bot_outputs/thumbnail.jpg", style=None,   # None = random
     )
 """
 
+import glob
+import json
+import math
 import os
+import random
 import re
 import time
-import random
-import requests
-from urllib.parse import quote
-from PIL import Image, ImageDraw, ImageOps
-from io import BytesIO
+from pathlib import Path
+
+import numpy as np
+from PIL import Image, ImageChops, ImageDraw, ImageFilter, ImageFont, ImageOps
 
 # ==========================================
 # CONFIG
 # ==========================================
-POLLINATIONS_API_KEY = os.getenv("POLLINATIONS_API_KEY", "").strip()
-
-CLASSIC_BASE = "https://image.pollinations.ai/prompt"
-GEN_BASE = "https://gen.pollinations.ai/image"
-
 THUMB_WIDTH = 1280
 THUMB_HEIGHT = 720
+W, H = THUMB_WIDTH, THUMB_HEIGHT
 
-DEFAULT_REFERENCE = "assets/reference_face.jpg"
+BASE_DIR = Path(__file__).resolve().parent
+ASSETS_DIR = BASE_DIR / "assets"
+FACES_DIR = ASSETS_DIR / "faces"
+FONT_MAIN = ASSETS_DIR / "fonts" / "Poppins-Bold.ttf"          # Hindi + English + ₹
+FONT_BIG = ASSETS_DIR / "fonts" / "ArchivoBlack-Regular.ttf"   # sirf English bade shabd
+
+STYLES = ("A", "B", "C")
+
+RED = (222, 18, 28)
+DARK_RED = (170, 10, 20)
+YELLOW = (255, 214, 10)
+BLACK = (14, 14, 16)
+WHITE = (255, 255, 255)
+GREEN = (36, 190, 80)
 
 
 # ==========================================
@@ -82,7 +100,7 @@ CATEGORY_KEYWORDS = {
     "home": [
         "home", "furniture", "bed", "sofa", "mattress", "curtain", "light", "bulb",
         "fan", "cooler", "ac", "air conditioner", "heater", "vacuum", "iron",
-        "washing machine", "refrigerator", "fridge"
+        "washing machine", "refrigerator", "fridge", "robot"
     ],
     "accessories": [
         "case", "cover", "screen guard", "tempered glass", "stand", "holder",
@@ -119,7 +137,11 @@ def detect_category(product_name: str, specs: dict = None) -> str:
 
     scores = {}
     for cat, keywords in CATEGORY_KEYWORDS.items():
-        score = sum(1 for kw in keywords if kw in text)
+        # poora shabd match ("headphones" me "phone" ya "playback" me "ac" nahi pakadna chahiye)
+        score = sum(
+            1 for kw in keywords
+            if re.search(r"(?<![a-z0-9])" + re.escape(kw) + r"s?(?![a-z0-9])", text)
+        )
         if score > 0:
             scores[cat] = score
 
@@ -129,279 +151,754 @@ def detect_category(product_name: str, specs: dict = None) -> str:
     return max(scores, key=scores.get)
 
 
-def _clean_product_name(name: str) -> str:
-    name = re.sub(r"[|–—\-].*$", "", name).strip()
-    name = re.sub(r"\s+", " ", name)
-    return name[:50]
+# Category-wise default copy (Gemini text fail ho to ye use hota hai)
+CATEGORY_COPY = {
+    "mobile":     dict(tail="धमाकेदार फोन", big=("SMART", "PHONE"), label="SMARTPHONE REVIEW",
+                       slogan=("हर पल बनाओ", "स्मार्ट!"), hook="खरीदने से पहले देखो!"),
+    "tv":         dict(tail="सिनेमा जैसा मज़ा", big=("BIG", "SCREEN"), label="SMART TV REVIEW",
+                       slogan=("घर को बनाओ", "थिएटर!"), hook="TV लेने से पहले देखो!"),
+    "audio":      dict(tail="ज़बरदस्त साउंड", big=("BASS", "BLAST"), label="SOUND SYSTEM REVIEW",
+                       slogan=("घर को बनाओ", "होम थिएटर!"), hook="साउंड का असली टेस्ट!"),
+    "laptop":     dict(tail="पावरफुल लैपटॉप", big=("POWER", "LAPTOP"), label="LAPTOP REVIEW",
+                       slogan=("काम को बनाओ", "फास्ट!"), hook="लैपटॉप लेने से पहले देखो!"),
+    "printer":    dict(tail="प्रिंटिंग का बादशाह", big=("SMART", "PRINTER"), label="PRINTER REVIEW",
+                       slogan=("ऑफिस को बनाओ", "स्मार्ट!"), hook="खरीदने से पहले देखो!"),
+    "smartwatch": dict(tail="स्मार्ट वॉच", big=("SMART", "WATCH"), label="SMARTWATCH REVIEW",
+                       slogan=("कलाई पर", "स्टाइल!"), hook="वॉच लेने से पहले देखो!"),
+    "kitchen":    dict(tail="किचन का साथी", big=("SMART", "KITCHEN"), label="KITCHEN REVIEW",
+                       slogan=("किचन को बनाओ", "स्मार्ट!"), hook="खरीदने से पहले देखो!"),
+    "home":       dict(tail="स्मार्ट घर", big=("SMART", "HOME"), label="HOME GADGET REVIEW",
+                       slogan=("घर को बनाओ", "स्मार्ट होम!"), hook="खरीदने से पहले देखो!"),
+    "gadget":     dict(tail="कमाल का गैजेट", big=("SMART", "GADGET"), label="GADGET REVIEW",
+                       slogan=("लाइफ को बनाओ", "स्मार्ट!"), hook="खरीदने से पहले देखो!"),
+}
+for _c in ("accessories", "women", "men", "travel", "automobile", "books"):
+    CATEGORY_COPY[_c] = CATEGORY_COPY["gadget"]
 
-
-def _extract_price(price: str, specs: dict = None) -> str:
-    if price and "₹" in str(price):
-        m = re.search(r"₹[\d,]+", str(price))
-        if m:
-            return m.group(0)
-    if specs:
-        for v in specs.values():
-            m = re.search(r"₹[\d,]+", str(v))
-            if m:
-                return m.group(0)
-    return "₹999"
-
-
-# ==========================================
-# PROMPT BUILDERS (category-wise)
-# ==========================================
-def _base_girl() -> str:
-    return (
-        "Beautiful young Indian woman long dark wavy hair, bright yellow top, "
-        "excited big open-mouth smile, pointing both index fingers at the product. "
-    )
-
-
-def build_mobile_prompt(product: str, price: str, specs: dict) -> str:
-    ram = specs.get("ram", "8GB RAM")
-    storage = specs.get("storage", "128GB")
-    camera = specs.get("camera", "50MP")
-    battery = specs.get("battery", "5000mAh")
-
-    return (
-        f"YouTube thumbnail 16:9, TechGlow India style. {_base_girl()}"
-        f"Two smartphones on wooden table front and back view of {product}. "
-        f"Huge bold yellow text '{product}'. "
-        f"Yellow banner '{storage} | {ram}'. "
-        f"Right side icons: {ram}, {storage}, {camera} Camera, {battery} Battery, 5G. "
-        f"Bottom left 4.2/5 star badge. Bottom right red price '{price}'. "
-        f"Bright yellow black high contrast clickbait, photorealistic, no watermark."
-    )
-
-
-def build_audio_prompt(product: str, price: str, specs: dict) -> str:
-    power = specs.get("power", specs.get("watt", "130W"))
-    return (
-        f"YouTube thumbnail 16:9 ultra realistic, TechGlow India style. {_base_girl()}"
-        f"Two tall glossy black tower multimedia speakers with glowing multi-color RGB LED rings "
-        f"(blue cyan purple pink) standing on wooden table, remote control in front. "
-        f"Huge bold yellow black banner text 'सिर्फ {price} में {product} तबाही!'. "
-        f"Subtitle '{product}'. "
-        f"Left red-yellow badge '{power} POWER DOUBLE TOWER BASS BLAST'. "
-        f"Right side vertical feature badges: {power} Power Output, Deep Bass Experience, "
-        f"Bluetooth Connectivity, USB / SD Support, FM Radio Function, Remote Control Included. "
-        f"Bottom left banner 'घर को बनाओ होम थिएटर!'. Bottom right big red price tag '{price}'. "
-        f"Bright yellow red black high contrast clickbait, photorealistic, no watermark."
-    )
-
-
-def build_tv_prompt(product: str, price: str, specs: dict) -> str:
-    size = specs.get("size", "43 inch")
-    res = specs.get("resolution", "4K")
-    return (
-        f"YouTube thumbnail 16:9, TechGlow India style. {_base_girl()}"
-        f"Large modern {product} Smart TV on stand showing colorful content. "
-        f"Huge bold yellow text '{product}'. "
-        f"Yellow banner '{size} | {res} Ultra HD'. "
-        f"Right side icons: {size}, {res}, Smart TV, Dolby Audio, Voice Control. "
-        f"Bottom right red price '{price}'. "
-        f"Bright yellow black high contrast clickbait, photorealistic, no watermark."
-    )
-
-
-def build_laptop_prompt(product: str, price: str, specs: dict) -> str:
-    cpu = specs.get("cpu", "Intel i5")
-    ram = specs.get("ram", "16GB")
-    ssd = specs.get("storage", "512GB SSD")
-    return (
-        f"YouTube thumbnail 16:9, TechGlow India style. {_base_girl()}"
-        f"Open laptop and closed laptop of {product} on wooden desk. "
-        f"Huge bold yellow text '{product}'. "
-        f"Yellow banner '{cpu} | {ram} | {ssd}'. "
-        f"Right side icons: {cpu}, {ram} RAM, {ssd}, Full HD, Long Battery. "
-        f"Bottom right red price '{price}'. "
-        f"Bright yellow black high contrast clickbait, photorealistic, no watermark."
-    )
-
-
-def build_printer_prompt(product: str, price: str, specs: dict) -> str:
-    return (
-        f"YouTube thumbnail 16:9, TechGlow India style. {_base_girl()}"
-        f"{product} printer with paper coming out on desk. "
-        f"Huge bold yellow text '{product}'. "
-        f"Right side icons: Print, Scan, Copy, WiFi, Auto Duplex. "
-        f"Bottom right red price '{price}'. "
-        f"Bright yellow black high contrast clickbait, photorealistic, no watermark."
-    )
-
-
-def build_smartwatch_prompt(product: str, price: str, specs: dict) -> str:
-    return (
-        f"YouTube thumbnail 16:9, TechGlow India style. {_base_girl()}"
-        f"{product} smartwatch on wrist and close-up of watch face. "
-        f"Huge bold yellow text '{product}'. "
-        f"Right side icons: AMOLED, SpO2, Heart Rate, 7 Days Battery, Bluetooth Calling. "
-        f"Bottom right red price '{price}'. "
-        f"Bright yellow black high contrast clickbait, photorealistic, no watermark."
-    )
-
-
-def build_kitchen_prompt(product: str, price: str, specs: dict) -> str:
-    return (
-        f"YouTube thumbnail 16:9, TechGlow India style. {_base_girl()}"
-        f"{product} in modern kitchen setting on counter. "
-        f"Huge bold yellow text '{product}'. "
-        f"Right side icons: Powerful Motor, Easy Clean, 2 Year Warranty, Multiple Jars. "
-        f"Bottom right red price '{price}'. "
-        f"Bright yellow black high contrast clickbait, photorealistic, no watermark."
-    )
-
-
-def build_home_prompt(product: str, price: str, specs: dict) -> str:
-    return (
-        f"YouTube thumbnail 16:9, TechGlow India style. {_base_girl()}"
-        f"{product} in stylish home living room setting. "
-        f"Huge bold yellow text '{product}'. "
-        f"Right side feature icons relevant to product. "
-        f"Bottom right red price '{price}'. "
-        f"Bright yellow black high contrast clickbait, photorealistic, no watermark."
-    )
-
-
-def build_women_prompt(product: str, price: str, specs: dict) -> str:
-    return (
-        f"YouTube thumbnail 16:9, TechGlow India style. "
-        f"Beautiful young Indian woman modelling or holding {product}, excited smile. "
-        f"Huge bold yellow text '{product}'. "
-        f"Right side icons: Premium Quality, Comfort Fit, Latest Design, Best Price. "
-        f"Bottom right red price '{price}'. "
-        f"Bright yellow black high contrast clickbait, photorealistic, no watermark."
-    )
-
-
-def build_men_prompt(product: str, price: str, specs: dict) -> str:
-    return (
-        f"YouTube thumbnail 16:9, TechGlow India style. "
-        f"Handsome young Indian man modelling or holding {product}, confident smile. "
-        f"Huge bold yellow text '{product}'. "
-        f"Right side icons: Premium Quality, Comfort Fit, Latest Design, Best Price. "
-        f"Bottom right red price '{price}'. "
-        f"Bright yellow black high contrast clickbait, photorealistic, no watermark."
-    )
-
-
-def build_travel_prompt(product: str, price: str, specs: dict) -> str:
-    return (
-        f"YouTube thumbnail 16:9, TechGlow India style. {_base_girl()}"
-        f"{product} suitcase or travel bag in airport/travel setting. "
-        f"Huge bold yellow text '{product}'. "
-        f"Right side icons: Lightweight, Durable, Spacious, TSA Lock. "
-        f"Bottom right red price '{price}'. "
-        f"Bright yellow black high contrast clickbait, photorealistic, no watermark."
-    )
-
-
-def build_automobile_prompt(product: str, price: str, specs: dict) -> str:
-    return (
-        f"YouTube thumbnail 16:9, TechGlow India style. {_base_girl()}"
-        f"{product} with car or bike in background. "
-        f"Huge bold yellow text '{product}'. "
-        f"Right side feature icons. "
-        f"Bottom right red price '{price}'. "
-        f"Bright yellow black high contrast clickbait, photorealistic, no watermark."
-    )
-
-
-def build_books_prompt(product: str, price: str, specs: dict) -> str:
-    return (
-        f"YouTube thumbnail 16:9, TechGlow India style. {_base_girl()}"
-        f"Stack of books and close-up of {product} book cover. "
-        f"Huge bold yellow text '{product}'. "
-        f"Right side icons: Bestseller, Must Read, Latest Edition. "
-        f"Bottom right red price '{price}'. "
-        f"Bright yellow black high contrast clickbait, photorealistic, no watermark."
-    )
-
-
-def build_gadget_prompt(product: str, price: str, specs: dict) -> str:
-    return (
-        f"YouTube thumbnail 16:9, TechGlow India style. {_base_girl()}"
-        f"{product} product prominently displayed on table. "
-        f"Huge bold yellow text '{product}'. "
-        f"Right side feature icons relevant to the gadget. "
-        f"Bottom right red price '{price}'. "
-        f"Bright yellow black high contrast clickbait, photorealistic, no watermark."
-    )
-
-
-PROMPT_BUILDERS = {
-    "mobile": build_mobile_prompt,
-    "tv": build_tv_prompt,
-    "audio": build_audio_prompt,
-    "laptop": build_laptop_prompt,
-    "printer": build_printer_prompt,
-    "smartwatch": build_smartwatch_prompt,
-    "kitchen": build_kitchen_prompt,
-    "home": build_home_prompt,
-    "accessories": build_gadget_prompt,
-    "women": build_women_prompt,
-    "men": build_men_prompt,
-    "travel": build_travel_prompt,
-    "automobile": build_automobile_prompt,
-    "books": build_books_prompt,
-    "gadget": build_gadget_prompt,
+# Gemini background ke liye scene (koi insaan/text/product nahi)
+CATEGORY_SCENES = {
+    "mobile": "a modern desk setup with soft bokeh lights",
+    "tv": "a cozy modern living room with a plain wall",
+    "audio": "a stylish modern living room with warm lights",
+    "laptop": "a bright modern home-office desk area",
+    "kitchen": "a clean modern kitchen with marble counter",
+    "home": "a bright modern living room with large windows and plants",
 }
 
 
-def build_thumbnail_prompt(product_name: str, price: str = "", specs: dict = None, category: str = None) -> str:
-    """Build a complete thumbnail brief in the channel's approved visual style."""
-    specs = specs or {}
-    product = re.sub(r"\s+", " ", str(product_name or "Product")).strip()[:90]
-    price_text = str(price or "").strip()
-    if not price_text:
-        for key, value in specs.items():
-            if "price" in str(key).lower() or "₹" in str(value):
-                match = re.search(r"₹\s?[\d,]+", str(value))
-                if match:
-                    price_text = match.group(0).replace(" ", "")
-                    break
+# ==========================================
+# SMALL HELPERS
+# ==========================================
+def _font(size: int, big: bool = False) -> ImageFont.FreeTypeFont:
+    path = FONT_BIG if big else FONT_MAIN
+    try:
+        return ImageFont.truetype(str(path), int(size))
+    except Exception:
+        return ImageFont.load_default()
+
+
+def _is_latin(text: str) -> bool:
+    return all(ord(ch) < 0x0900 or ord(ch) > 0x097F for ch in text)
+
+
+def _clean_product_name(name: str) -> str:
+    name = re.sub(r"\s+", " ", str(name or "Product")).strip()
+    # lambe blog-title ka sirf product wala hissa lo (| ya : se pehle)
+    name = re.split(r"\s[|–—]\s|:\s|\s[Ww]ith\s", name)[0].strip()
+    if len(name) > 48:                      # shabd beech me na kate
+        name = name[:48].rsplit(" ", 1)[0]
+    return name
+
+
+def _extract_price(price: str, specs: dict = None) -> str:
+    """Sirf asli price lautata hai; na mile to khaali string (kabhi invent nahi karta)."""
+    if price:
+        m = re.search(r"₹\s?[\d,]+", str(price))
+        if m:
+            return m.group(0).replace(" ", "")
+    if specs:
+        for k, v in specs.items():
+            if "price" in str(k).lower() or "₹" in str(v):
+                m = re.search(r"₹\s?[\d,]+", str(v))
+                if m:
+                    return m.group(0).replace(" ", "")
+    return ""
+
+
+def _find_rating(specs: dict) -> str:
+    """Rating tabhi lautata hai jab article ke specs me sach me ho."""
+    for k, v in (specs or {}).items():
+        if "rating" in str(k).lower() or "star" in str(k).lower():
+            m = re.search(r"\b([0-5](?:\.\d)?)\b", str(v))
+            if m and 0 < float(m.group(1)) <= 5:
+                return f"{float(m.group(1)):g}"
+    return ""
+
+
+def _short_facts(specs: dict, limit: int = 6) -> list:
+    """Specs se chhote, verified fact-text (badge/checklist ke liye)."""
     facts = []
-    for key, value in specs.items():
-        value = re.sub(r"\s+", " ", str(value or "")).strip()
-        if value and len(value) <= 100 and "₹" not in value and not any(x in str(key).lower() for x in ("price", "rating")):
-            facts.append(f"{key}: {value}")
-        if len(facts) >= 5:
+    for k, v in (specs or {}).items():
+        key = str(k).lower()
+        val = re.sub(r"\s+", " ", str(v or "")).strip()
+        if not val or "₹" in val or any(x in key for x in ("price", "rating", "star", "link", "url")):
+            continue
+        if len(val) <= 22:
+            facts.append(val)
+        if len(facts) >= limit:
             break
-    category = category or detect_category(product, specs)
-    fact_text = "\n".join(facts) if facts else "No verified specifications available."
-    price_line = f"Show exact price: {price_text}." if price_text else "Do not invent or display a price."
-    return f"""
-Create a complete, premium, highly clickable INDIAN TECH REVIEW YouTube thumbnail.
-Canvas: wide 16:9 landscape, 1280x720.
+    return facts
 
-VISUAL STYLE — follow this composition:
-- Photorealistic cheerful young Indian female presenter on the LEFT, waist-up, bright yellow sweater/top, excited smile, pointing toward the product with both hands.
-- Beautiful modern living-room/studio background, warm cinematic lighting, softly blurred.
-- Actual product LARGE, sharp, realistic and naturally integrated on the RIGHT. Never place it inside a small white picture-in-picture box.
-- Bold layered paint-brush banners across TOP/CENTRE in RED, YELLOW and BLACK, large high-contrast Hindi/Hinglish lettering.
-- A few circular feature badges/icons around product, subtle blue/purple neon rings near product, bold red price strip along bottom.
-- Energetic professional ad design, strong contrast, clean composition, crisp photorealism.
-- Keep face, product and text inside safe margins; readable on a phone.
 
-PRODUCT:
-Exact name: {product}
+def _split_two_lines(text: str, max_chars: int = 11):
+    words = text.split()
+    if len(text) <= max_chars or len(words) == 1:
+        return (text[:max_chars + 3], "")
+    best = None
+    for i in range(1, len(words)):
+        a, b = " ".join(words[:i]), " ".join(words[i:])
+        score = max(len(a), len(b))
+        if best is None or score < best[0]:
+            best = (score, a, b)
+    return (best[1][:max_chars + 3], best[2][:max_chars + 3])
+
+
+def _fit_font(draw, text, max_w, max_h, start, min_size=12, big=False):
+    size = int(start)
+    while size > min_size:
+        f = _font(size, big)
+        l, t, r, b = draw.textbbox((0, 0), text, font=f)
+        if (r - l) <= max_w and (b - t) <= max_h:
+            return f
+        size -= 2
+    return _font(min_size, big)
+
+
+def _runs_width(draw, runs, font, stroke=0):
+    return sum(draw.textlength(t, font=font) for t, _ in runs) + 2 * stroke
+
+
+def _draw_runs(draw, runs, cx, cy, font, stroke=4, stroke_fill=BLACK):
+    """Rang-birange text runs ko (cx, cy) par center karke likhta hai."""
+    total = sum(draw.textlength(t, font=font) for t, _ in runs)
+    x = cx - total / 2
+    for text, color in runs:
+        draw.text((x, cy), text, font=font, fill=color, anchor="lm",
+                  stroke_width=stroke, stroke_fill=stroke_fill)
+        x += draw.textlength(text, font=font)
+
+
+def _fit_runs(draw, runs, max_w, max_h, start, big=False, stroke=4):
+    size = int(start)
+    while size > 14:
+        f = _font(size, big)
+        w = sum(draw.textlength(t, font=f) for t, _ in runs) + 2 * stroke
+        l, t, r, b = draw.textbbox((0, 0), "".join(t for t, _ in runs), font=f)
+        if w <= max_w and (b - t) <= max_h:
+            return f
+        size -= 2
+    return _font(14, big)
+
+
+# ==========================================
+# SHAPES (anti-aliased)
+# ==========================================
+def _gradient(size, c1, c2, vertical=True):
+    w, h = size
+    t = np.linspace(0, 1, h if vertical else w, dtype=np.float32)
+    t = t[:, None] if vertical else t[None, :]
+    c1 = np.array(c1, dtype=np.float32)
+    c2 = np.array(c2, dtype=np.float32)
+    arr = c1 + (c2 - c1) * t[..., None]
+    if vertical:
+        arr = np.repeat(arr, w, axis=1)
+    else:
+        arr = np.repeat(arr, h, axis=0)
+    return Image.fromarray(arr.astype(np.uint8), "RGB")
+
+
+def _paint_poly(canvas, pts, fill, ss=3):
+    """Polygon ko anti-aliased banakar canvas (RGBA) par chipkata hai. fill = color ya (c1, c2) gradient."""
+    xs = [p[0] for p in pts]
+    ys = [p[1] for p in pts]
+    x0, y0 = int(max(0, min(xs) - 2)), int(max(0, min(ys) - 2))
+    x1, y1 = int(min(W, max(xs) + 3)), int(min(H, max(ys) + 3))
+    if x1 <= x0 or y1 <= y0:
+        return
+    bw, bh = x1 - x0, y1 - y0
+    mask = Image.new("L", (bw * ss, bh * ss), 0)
+    ImageDraw.Draw(mask).polygon([((x - x0) * ss, (y - y0) * ss) for x, y in pts], fill=255)
+    mask = mask.resize((bw, bh), Image.Resampling.LANCZOS)
+    if isinstance(fill[0], tuple):
+        layer = _gradient((bw, bh), fill[0], fill[1])
+    else:
+        layer = Image.new("RGB", (bw, bh), fill)
+    canvas.paste(layer, (x0, y0), mask)
+
+
+def _brush_pts(x0, y0, x1, y1, rng, rough=5, skew=0, torn_right=False):
+    """Paint-brush jaisi khurdari patti ke polygon points."""
+    pts = []
+    n = max(3, int((x1 - x0) / 34))
+    for i in range(n + 1):                                   # upar ka kinara
+        pts.append((x0 + (x1 - x0) * i / n, y0 + rng.uniform(-rough, rough)))
+    m = max(3, int((y1 - y0) / 13))
+    for j in range(1, m + 1):                                # daaya kinara (spiky)
+        spike = rng.uniform(-6, 16 if torn_right else 8)
+        pts.append((x1 + spike, y0 + (y1 - y0) * j / m))
+    for i in range(n, -1, -1):                               # neeche ka kinara
+        pts.append((x0 + (x1 - x0) * i / n, y1 + rng.uniform(-rough, rough)))
+    for j in range(m - 1, 0, -1):                            # baaya kinara (spiky)
+        pts.append((x0 - rng.uniform(-6, 14), y0 + (y1 - y0) * j / m))
+    if skew:
+        yc, h = (y0 + y1) / 2, max(1, y1 - y0)
+        pts = [(x + skew * (yc - y) / h, y) for x, y in pts]
+    return pts
+
+
+def _banner(canvas, box, fill, rng, rough=5, skew=6, torn_right=False, shadow=True):
+    x0, y0, x1, y1 = box
+    pts = _brush_pts(x0, y0, x1, y1, rng, rough=rough, skew=skew, torn_right=torn_right)
+    if shadow:
+        _paint_poly(canvas, [(x + 5, y + 6) for x, y in pts], (0, 0, 0))
+    _paint_poly(canvas, pts, fill)
+
+
+def _star_pts(cx, cy, r_out, r_in, n=5, rot=-90):
+    pts = []
+    for i in range(n * 2):
+        r = r_out if i % 2 == 0 else r_in
+        a = math.radians(rot + i * 180 / n)
+        pts.append((cx + r * math.cos(a), cy + r * math.sin(a)))
+    return pts
+
+
+def _burst_pts(cx, cy, r_out, r_in, n=22):
+    return _star_pts(cx, cy, r_out, r_in, n=n, rot=-90)
+
+
+def _rounded(canvas, box, radius, fill, outline=None, width=0, ss=3):
+    x0, y0, x1, y1 = [int(v) for v in box]
+    bw, bh = x1 - x0, y1 - y0
+    mask = Image.new("L", (bw * ss, bh * ss), 0)
+    ImageDraw.Draw(mask).rounded_rectangle((0, 0, bw * ss - 1, bh * ss - 1), radius * ss, fill=255)
+    mask = mask.resize((bw, bh), Image.Resampling.LANCZOS)
+    if isinstance(fill[0], tuple):
+        layer = _gradient((bw, bh), fill[0], fill[1], vertical=False)
+    else:
+        layer = Image.new("RGB", (bw, bh), fill)
+    canvas.paste(layer, (x0, y0), mask)
+    if outline and width:
+        ImageDraw.Draw(canvas).rounded_rectangle((x0, y0, x1, y1), radius, outline=outline, width=width)
+
+
+def _icon(canvas, kind, cx, cy, r):
+    """Chhote vector icons (star / tick / bolt / rupee) – safed gole ke andar."""
+    d = ImageDraw.Draw(canvas)
+    d.ellipse((cx - r, cy - r, cx + r, cy + r), fill=WHITE)
+    if kind == "star":
+        _paint_poly(canvas, _star_pts(cx, cy + 1, r * 0.72, r * 0.3), (255, 170, 0))
+    elif kind == "tick":
+        d.line([(cx - r * .45, cy + r * .02), (cx - r * .1, cy + r * .38), (cx + r * .5, cy - r * .38)],
+               fill=GREEN, width=max(4, int(r * .28)), joint="curve")
+    elif kind == "bolt":
+        _paint_poly(canvas, [(cx + r * .1, cy - r * .7), (cx - r * .45, cy + r * .1), (cx - r * .02, cy + r * .1),
+                             (cx - r * .15, cy + r * .72), (cx + r * .48, cy - r * .12), (cx + r * .04, cy - r * .12)],
+                    (240, 130, 0))
+    else:
+        f = _font(int(r * 1.25))
+        d.text((cx, cy), "₹", font=f, fill=(200, 20, 30), anchor="mm")
+
+
+# ==========================================
+# BACKGROUNDS
+# ==========================================
+def _bokeh(img, rng, n=18, colors=((255, 255, 255),), alpha=(30, 80), rmin=20, rmax=70):
+    layer = Image.new("RGBA", (W, H), (0, 0, 0, 0))
+    d = ImageDraw.Draw(layer)
+    for _ in range(n):
+        r = rng.randint(rmin, rmax)
+        x, y = rng.randint(-20, W + 20), rng.randint(-20, H + 20)
+        c = rng.choice(colors)
+        d.ellipse((x - r, y - r, x + r, y + r), fill=c + (rng.randint(*alpha),))
+    layer = layer.filter(ImageFilter.GaussianBlur(10))
+    img.alpha_composite(layer)
+
+
+def _vignette(img, strength=0.55):
+    yy, xx = np.mgrid[0:H, 0:W].astype(np.float32)
+    d = np.sqrt(((xx - W / 2) / (W / 2)) ** 2 + ((yy - H / 2) / (H / 2)) ** 2)
+    a = np.clip((d - 0.55) / 0.9, 0, 1) ** 1.6 * strength * 255
+    layer = Image.new("RGBA", (W, H), (0, 0, 0, 0))
+    layer.putalpha(Image.fromarray(a.astype(np.uint8), "L"))
+    img.alpha_composite(layer)
+
+
+def _bg_room_fallback(rng):
+    """Gemini na chale to garam, ghar jaisa background (code se)."""
+    img = _gradient((W, H), (246, 232, 214), (214, 180, 146)).convert("RGBA")
+    floor_y = int(H * 0.66)
+    floor = _gradient((W, H - floor_y), (186, 140, 100), (120, 82, 52)).convert("RGBA")
+    img.alpha_composite(floor, (0, floor_y))
+    layer = Image.new("RGBA", (W, H), (0, 0, 0, 0))
+    d = ImageDraw.Draw(layer)
+    d.rectangle((W - 330, 0, W, floor_y), fill=(255, 250, 235, 150))          # khidki ki roshni
+    d.rectangle((40, 90, 300, floor_y - 40), fill=(150, 105, 70, 70))         # shelf jaisa hissa
+    img.alpha_composite(layer.filter(ImageFilter.GaussianBlur(28)))
+    _bokeh(img, rng, n=14, colors=((255, 230, 180), (255, 255, 255)), alpha=(40, 90))
+    return img
+
+
+def _gemini_keys():
+    keys = [os.getenv(f"GEMINI_API_KEY_{i}", "").strip() for i in (1, 2, 3)]
+    return [k for k in keys if k]
+
+
+def _ai_background(category: str):
+    """Gemini se text-free, insaan-free room background. Fail ho to None."""
+    if os.getenv("THUMB_AI_BACKGROUND", "true").strip().lower() in ("0", "false", "no", "off"):
+        return None
+    keys = _gemini_keys()
+    if not keys:
+        return None
+    try:
+        from google import genai
+        from google.genai import types
+    except Exception as exc:
+        print(f"ℹ️ google-genai import nahi hua: {exc}")
+        return None
+
+    scene = CATEGORY_SCENES.get(category, "a bright modern living room with plants")
+    prompt = (
+        f"Photorealistic wide 16:9 background photo of {scene}. Warm cinematic natural light, "
+        "softly blurred depth of field, clean uncluttered centre and right side, light cream and warm wood tones. "
+        "ABSOLUTELY NO people, NO text, NO letters, NO logos, NO products, NO screens with content."
+    )
+    model = os.getenv("GEMINI_IMAGE_MODEL", "gemini-3.1-flash-image").strip()
+    models = [model] + (["gemini-2.5-flash-image"] if model != "gemini-2.5-flash-image" else [])
+    for model_name in models:
+        for key_no, api_key in enumerate(keys, 1):
+            try:
+                print(f"🎨 Gemini background: model={model_name}, key={key_no}")
+                client = genai.Client(api_key=api_key)
+                resp = client.models.generate_content(
+                    model=model_name, contents=[prompt],
+                    config=types.GenerateContentConfig(
+                        response_modalities=["IMAGE"],
+                        image_config=types.ImageConfig(aspect_ratio="16:9")),
+                )
+                for part in resp.parts:
+                    if getattr(part, "inline_data", None) is not None:
+                        im = part.as_image().convert("RGB")
+                        im = ImageOps.fit(im, (W, H), method=Image.Resampling.LANCZOS)
+                        return im.filter(ImageFilter.GaussianBlur(1.5)).convert("RGBA")
+            except Exception as exc:
+                print(f"⚠️ Gemini background fail ({model_name}, key {key_no}): {exc}")
+                time.sleep(1.5)
+    return None
+
+
+def _bg_neon(rng):
+    """Style B: dark neon (navy → purple) + roshni ki kirnein."""
+    yy, xx = np.mgrid[0:H, 0:W].astype(np.float32)
+    d = np.sqrt(((xx - 760) / 760) ** 2 + ((yy - 330) / 520) ** 2)
+    t = np.clip(d, 0, 1)[..., None]
+    inner, outer = np.array([120, 40, 190], np.float32), np.array([8, 10, 38], np.float32)
+    img = Image.fromarray((inner * (1 - t) + outer * t).astype(np.uint8), "RGB").convert("RGBA")
+    rays = Image.new("RGBA", (W, H), (0, 0, 0, 0))
+    rd = ImageDraw.Draw(rays)
+    for i in range(14):
+        a0 = math.radians(i * 360 / 14)
+        a1 = a0 + math.radians(9)
+        rd.polygon([(780, 340), (780 + 1500 * math.cos(a0), 340 + 1500 * math.sin(a0)),
+                    (780 + 1500 * math.cos(a1), 340 + 1500 * math.sin(a1))], fill=(255, 255, 255, 18))
+    img.alpha_composite(rays.filter(ImageFilter.GaussianBlur(6)))
+    _bokeh(img, rng, n=16, colors=((0, 220, 255), (255, 60, 200), (255, 220, 60)), alpha=(25, 60), rmin=14, rmax=50)
+    return img
+
+
+def _bg_diagonal(rng):
+    """Style C: diagonal rang – baayen neela/purple, daayen garam orange glow."""
+    yy, xx = np.mgrid[0:H, 0:W].astype(np.float32)
+    t = np.clip((xx / W) * 0.85 + (yy / H) * 0.15, 0, 1)[..., None]
+    a, b = np.array([20, 24, 110], np.float32), np.array([150, 40, 170], np.float32)
+    arr = a * (1 - t) + b * t
+    g = np.exp(-(((xx - 1010) / 380) ** 2 + ((yy - 380) / 330) ** 2))[..., None]
+    arr = arr * (1 - g * 0.9) + np.array([255, 170, 30], np.float32) * g * 0.9
+    img = Image.fromarray(np.clip(arr, 0, 255).astype(np.uint8), "RGB").convert("RGBA")
+    layer = Image.new("RGBA", (W, H), (0, 0, 0, 0))
+    ImageDraw.Draw(layer).polygon([(0, H), (520, 0), (610, 0), (110, H)], fill=(255, 255, 255, 16))
+    img.alpha_composite(layer)
+    _bokeh(img, rng, n=12, colors=((255, 255, 255), (255, 210, 120)), alpha=(25, 55), rmin=16, rmax=55)
+    return img
+
+
+# ==========================================
+# PRODUCT + FACE
+# ==========================================
+def _white_bg_cutout(img: Image.Image):
+    """Safed background wali product photo se background hatata hai. Fail ho to None."""
+    rgb = img.convert("RGB")
+    w, h = rgb.size
+    scale = min(1.0, 900 / max(w, h))
+    if scale < 1:
+        rgb = rgb.resize((int(w * scale), int(h * scale)), Image.Resampling.LANCZOS)
+        w, h = rgb.size
+    marker = (255, 0, 255)
+    work = rgb.copy()
+    seeds = [(0, 0), (w - 1, 0), (0, h - 1), (w - 1, h - 1), (w // 2, 0), (w // 2, h - 1), (0, h // 2), (w - 1, h // 2)]
+    for s in seeds:
+        px = work.getpixel(s)
+        if min(px) >= 225 and work.getpixel(s) != marker:
+            ImageDraw.floodfill(work, s, marker, thresh=28)
+    arr = np.array(work)
+    bg = (arr[..., 0] == 255) & (arr[..., 1] == 0) & (arr[..., 2] == 255)
+    if bg.mean() < 0.12:                      # background hataya hi nahi gaya (safed nahi tha)
+        return None
+    alpha = Image.fromarray((~bg * 255).astype(np.uint8), "L")
+    alpha = alpha.filter(ImageFilter.MinFilter(3)).filter(ImageFilter.GaussianBlur(0.8))
+    coverage = (np.array(alpha) > 128).mean()
+    if coverage < 0.05 or coverage > 0.85:
+        return None
+    out = rgb.convert("RGBA")
+    out.putalpha(alpha)
+    bbox = alpha.point(lambda v: 255 if v > 40 else 0).getbbox()
+    return out.crop(bbox) if bbox else None
+
+
+def _photo_card(img: Image.Image):
+    """Cutout na ban sake to photo ko saaf rounded card me dikhata hai."""
+    im = img.convert("RGB")
+    im.thumbnail((700, 700), Image.Resampling.LANCZOS)
+    pad = 12
+    card = Image.new("RGBA", (im.width + 2 * pad, im.height + 2 * pad), (0, 0, 0, 0))
+    mask = Image.new("L", card.size, 0)
+    ImageDraw.Draw(mask).rounded_rectangle((0, 0, card.width - 1, card.height - 1), 30, fill=255)
+    card.paste((255, 255, 255, 255), (0, 0), mask)
+    inner = Image.new("L", im.size, 0)
+    ImageDraw.Draw(inner).rounded_rectangle((0, 0, im.width - 1, im.height - 1), 22, fill=255)
+    card.paste(im.convert("RGBA"), (pad, pad), inner)
+    return card
+
+
+def _prepare_product(path):
+    if not path or not os.path.isfile(path):
+        return None, "none"
+    try:
+        with Image.open(path) as src:
+            src = ImageOps.exif_transpose(src)
+            cut = _white_bg_cutout(src)
+            if cut is not None:
+                return cut, "cutout"
+            return _photo_card(src), "card"
+    except Exception as exc:
+        print(f"⚠️ Product photo process nahi hui: {exc}")
+        return None, "none"
+
+
+def _glow(canvas, cx, cy, rx, ry, color, alpha=150, blur=40):
+    layer = Image.new("RGBA", (W, H), (0, 0, 0, 0))
+    ImageDraw.Draw(layer).ellipse((cx - rx, cy - ry, cx + rx, cy + ry), fill=color + (alpha,))
+    canvas.alpha_composite(layer.filter(ImageFilter.GaussianBlur(blur)))
+
+
+def _place_product(canvas, prod, kind, box, outline=True):
+    """Product ko box ke andar bada karke, box ke neeche-beech me rakhta hai. (x, y, w, h) lautata hai."""
+    bx0, by0, bx1, by1 = box
+    bw, bh = bx1 - bx0, by1 - by0
+    scale = min(bw / prod.width, bh / prod.height)
+    size = (max(2, int(prod.width * scale)), max(2, int(prod.height * scale)))
+    p = prod.resize(size, Image.Resampling.LANCZOS)
+    x = int(bx0 + (bw - size[0]) / 2)
+    y = int(by1 - size[1])
+    # zameen par parchhai
+    sh = Image.new("RGBA", (W, H), (0, 0, 0, 0))
+    ImageDraw.Draw(sh).ellipse((x - 10, by1 - 18, x + size[0] + 10, by1 + 22), fill=(0, 0, 0, 120))
+    canvas.alpha_composite(sh.filter(ImageFilter.GaussianBlur(12)))
+    if kind == "cutout" and outline:
+        a = p.getchannel("A").filter(ImageFilter.MaxFilter(7)).filter(ImageFilter.GaussianBlur(1))
+        halo = Image.new("RGBA", p.size, (255, 255, 255, 0))
+        halo.putalpha(a.point(lambda v: int(v * 0.55)))
+        canvas.alpha_composite(halo, (x, y))
+    canvas.alpha_composite(p, (x, y))
+    return x, y, size[0], size[1]
+
+
+def _neon_rings(canvas, cx, cy, rx, colors=((60, 120, 255), (150, 70, 255), (255, 70, 200))):
+    layer = Image.new("RGBA", (W, H), (0, 0, 0, 0))
+    d = ImageDraw.Draw(layer)
+    for i, col in enumerate(colors):
+        r = rx * (1 - i * 0.17)
+        ry = r * 0.27
+        d.ellipse((cx - r, cy - ry, cx + r, cy + ry), outline=col + (255,), width=5)
+    canvas.alpha_composite(layer.filter(ImageFilter.GaussianBlur(7)))
+    canvas.alpha_composite(layer)
+
+
+def _pick_face(reference_face_path, rng):
+    if reference_face_path and os.path.isfile(reference_face_path):
+        return reference_face_path
+    files = sorted(glob.glob(str(FACES_DIR / "*.png")) + glob.glob(str(FACES_DIR / "*.webp")))
+    return rng.choice(files) if files else None
+
+
+def _place_face(canvas, path, max_h=575, max_w=440, x=-12, bottom=H + 8):
+    if not path:
+        return None
+    try:
+        face = Image.open(path).convert("RGBA")
+    except Exception as exc:
+        print(f"⚠️ Face photo load nahi hui: {exc}")
+        return None
+    bbox = face.getchannel("A").point(lambda v: 255 if v > 20 else 0).getbbox()
+    if bbox:
+        face = face.crop(bbox)
+    s = min(max_h / face.height, max_w / face.width)
+    face = face.resize((int(face.width * s), int(face.height * s)), Image.Resampling.LANCZOS)
+    fx, fy = x, bottom - face.height
+    a = face.getchannel("A")
+    shadow = Image.new("RGBA", (W, H), (0, 0, 0, 0))
+    sh = Image.new("RGBA", face.size, (0, 0, 0, 0))
+    sh.putalpha(a.point(lambda v: int(v * 0.5)))
+    shadow.alpha_composite(sh, (fx + 8, fy + 8))
+    canvas.alpha_composite(shadow.filter(ImageFilter.GaussianBlur(9)))
+    rim = Image.new("RGBA", face.size, (255, 255, 255, 0))
+    rim.putalpha(a.filter(ImageFilter.MaxFilter(9)).filter(ImageFilter.GaussianBlur(1)))
+    canvas.alpha_composite(rim, (fx, fy))
+    canvas.alpha_composite(face, (fx, fy))
+    return fx, fy, face.width, face.height
+
+
+# ==========================================
+# TEXT COPY (Gemini + safe fallback)
+# ==========================================
+def _default_copy(product, category, specs):
+    base = CATEGORY_COPY.get(category, CATEGORY_COPY["gadget"])
+    facts = _short_facts(specs)
+    badges = []
+    icons = ["tick", "bolt", "tick", "bolt"]
+    defaults = [("Best", "Features"), ("Value for", "Money"), ("Full", "Review"), ("Honest", "Opinion")]
+    for i in range(4):
+        badges.append(_split_two_lines(facts[i]) if i < len(facts) else defaults[i])
+    checks = (facts + ["पूरा रिव्यू", "असली टेस्ट", "सच्ची राय"])[:3]
+    return dict(
+        tail=base["tail"], hook=base["hook"], big1=base["big"][0], big2=base["big"][1],
+        label=base["label"], slogan_a=base["slogan"][0], slogan_b=base["slogan"][1],
+        badges=badges, icons=icons, checks=checks,
+    )
+
+
+def _llm_copy(product, price, category, specs):
+    """Gemini se chhota Hindi copy. Sirf supplied facts; kuch bhi invent nahi."""
+    keys = _gemini_keys()
+    if not keys or os.getenv("THUMB_AI_COPY", "true").strip().lower() in ("0", "false", "no", "off"):
+        return None
+    try:
+        from google import genai
+        from google.genai import types
+    except Exception:
+        return None
+    facts = "\n".join(f"- {k}: {v}" for k, v in (specs or {}).items()
+                      if v and len(str(v)) <= 100 and "₹" not in str(v))[:900]
+    prompt = f"""You write short text for an Indian tech-review YouTube thumbnail.
+Product: {product}
 Category: {category}
-Verified article facts:
-{fact_text}
-{price_line}
+Price: {price or "unknown"}
+Verified facts:
+{facts or "none"}
 
-PRODUCT PHOTO RULE:
-If a product photo is supplied, treat it as the visual source of truth. Recreate the SAME model, colour, shape, camera layout and proportions. Do not substitute another product. Do not paste the photo into an inset/card; integrate the product naturally into the full scene.
+Return ONLY JSON with these keys:
+"tail": Hindi (Devanagari) 2-3 words, max 16 chars, completes the line "सिर्फ ₹PRICE में ___!" e.g. "स्मार्ट सफाई"
+"hook": Hindi (Devanagari) max 24 chars, curiosity line e.g. "खरीदने से पहले देखो!"
+"big1": ONE English word, UPPERCASE, max 7 letters
+"big2": ONE English word, UPPERCASE, max 9 letters
+"label": English product type, UPPERCASE, max 24 chars e.g. "ROBOT VACUUM & MOP"
+"slogan_a": Hindi max 14 chars, "slogan_b": Hindi max 12 chars (together a catchy line like "घर को बनाओ" + "स्मार्ट होम!")
+"badges": list of 4 objects {{"l1": max 11 chars, "l2": max 11 chars}} — 4 different real features from the verified facts
+"checks": list of 3 short strings, max 18 chars each, from the verified facts
 
-ACCURACY:
-Use only supplied facts. Never invent battery, camera, rating, storage, warranty, performance claims or specifications. No fake ratings or unsupported feature badges.
+RULES: use ONLY the verified facts. Never invent ratings, numbers, awards, warranty or performance claims.
+Do not mention price inside badges. Keep everything short and bold."""
+    for api_key in keys[:2]:
+        try:
+            client = genai.Client(api_key=api_key)
+            resp = client.models.generate_content(
+                model=os.getenv("GEMINI_MODEL_NAME", "gemini-3.6-flash").strip() or "gemini-3.6-flash",
+                contents=prompt,
+                config=types.GenerateContentConfig(response_mime_type="application/json", temperature=0.6),
+            )
+            raw = (resp.text or "").strip()
+            raw = re.sub(r"^```(?:json)?|```$", "", raw, flags=re.M).strip()
+            data = json.loads(raw)
+            if isinstance(data, dict):
+                return data
+        except Exception as exc:
+            print(f"⚠️ Gemini thumbnail-copy fail: {exc}")
+            time.sleep(1)
+    return None
 
-TEXT:
-Show the exact product name clearly. Use short, bold Hindi/Hinglish promotional copy based only on verified facts. If price is available, show that exact price. Use large white/yellow text with black outlines on red/yellow/black brush banners. Avoid tiny text and long paragraphs.
 
-The result must be a newly designed complete thumbnail in this style — NOT a video screenshot, NOT a blurred frame with a product photo pasted in a white rectangle, and NOT a collage.
-""".strip()
+def _build_copy(product, price, category, specs):
+    copy = _default_copy(product, category, specs)
+    ai = _llm_copy(product, price, category, specs)
+    if not ai:
+        return copy
+
+    def ok(val, n):
+        return isinstance(val, str) and 0 < len(val.strip()) <= n
+
+    for key, n in (("tail", 18), ("hook", 26), ("slogan_a", 16), ("slogan_b", 14)):
+        if ok(ai.get(key), n):
+            copy[key] = ai[key].strip()
+    for key, n in (("big1", 8), ("big2", 10), ("label", 26)):
+        v = ai.get(key)
+        if ok(v, n) and _is_latin(v):
+            copy[key] = v.strip().upper()
+    if isinstance(ai.get("badges"), list):
+        for i, b in enumerate(ai["badges"][:4]):
+            if isinstance(b, dict) and ok(b.get("l1"), 13) and (not b.get("l2") or ok(b.get("l2"), 13)):
+                copy["badges"][i] = (b["l1"].strip(), (b.get("l2") or "").strip())
+    if isinstance(ai.get("checks"), list):
+        for i, c in enumerate(ai["checks"][:3]):
+            if ok(c, 20):
+                copy["checks"][i] = c.strip()
+    return copy
+
+
+# ==========================================
+# STYLE RENDERERS
+# ==========================================
+def _brand_tag(canvas):
+    _rounded(canvas, (12, 12, 262, 66), 14, BLACK, outline=WHITE, width=2)
+    d = ImageDraw.Draw(canvas)
+    f = _fit_font(d, "TECHGLOW INDIA", 218, 30, 26, big=True)
+    d.text((137, 39), "TECHGLOW INDIA", font=f, fill=WHITE, anchor="mm")
+
+
+def _centered(d, text, box, color, start, big=False, stroke=3, stroke_fill=BLACK):
+    x0, y0, x1, y1 = box
+    f = _fit_font(d, text, (x1 - x0) - 2 * stroke - 8, (y1 - y0) - 8, start, big=big)
+    d.text(((x0 + x1) / 2, (y0 + y1) / 2 + 1), text, font=f, fill=color, anchor="mm",
+           stroke_width=stroke, stroke_fill=stroke_fill)
+
+
+def _price_runs(price, tail):
+    if price:
+        return [("सिर्फ ", WHITE), (price, YELLOW), (f" में {tail}!", WHITE)]
+    return [(f"{tail}!", YELLOW)]
+
+
+def render_style_a(canvas, ctx, rng):
+    d = ImageDraw.Draw(canvas)
+    cp, price, name = ctx["copy"], ctx["price"], ctx["name"]
+    # --- top: red headline banner + yellow product-name strip ---
+    _banner(canvas, (276, 26, 1040, 118), (RED, DARK_RED), rng, skew=8)
+    _draw_runs(d, _price_runs(price, cp["tail"]), 660, 74,
+               _fit_runs(d, _price_runs(price, cp["tail"]), 700, 72, 66), stroke=4)
+    _banner(canvas, (292, 116, 1030, 176), YELLOW, rng, rough=3, skew=6)
+    _centered(d, name, (300, 120, 1022, 172), BLACK, 38, stroke=0)
+    # --- centre-left: big words ---
+    _banner(canvas, (360, 238, 800, 346), (BLACK, (45, 45, 50)), rng, skew=14)
+    _centered(d, cp["big1"], (372, 240, 790, 344), WHITE, 92, big=True, stroke=3, stroke_fill=BLACK)
+    _banner(canvas, (336, 350, 790, 448), (RED, DARK_RED), rng, skew=14)
+    _centered(d, cp["big2"], (350, 352, 780, 446), WHITE, 82, big=True, stroke=5, stroke_fill=BLACK)
+    _banner(canvas, (352, 448, 760, 516), YELLOW, rng, rough=3, skew=10)
+    _centered(d, cp["label"], (362, 452, 750, 512), BLACK, 34, stroke=0)
+    # --- right: 4 badges ---
+    palette = [((120, 50, 200), (170, 70, 230)), ((30, 100, 220), (60, 150, 245)),
+               ((20, 160, 70), (60, 200, 100)), ((240, 110, 10), (255, 160, 40))]
+    badges = []
+    rating = ctx["rating"]
+    if rating:
+        badges.append((f"{rating} Star", "Rating", "star"))
+    for i, (l1, l2) in enumerate(cp["badges"]):
+        badges.append((l1, l2, cp["icons"][i % len(cp["icons"])]))
+    for i, (l1, l2, ic) in enumerate(badges[:4]):
+        y0 = 138 + i * 92
+        _rounded(canvas, (1066, y0, 1272, y0 + 78), 22, palette[i], outline=(255, 255, 255), width=3)
+        _icon(canvas, ic, 1102, y0 + 39, 20)
+        lines = [t for t in (l1, l2) if t]
+        f = _fit_font(d, max(lines, key=len), 124, 30, 26)
+        if len(lines) == 2:
+            d.text((1134, y0 + 24), lines[0], font=f, fill=WHITE, anchor="lm")
+            d.text((1134, y0 + 54), lines[1], font=f, fill=WHITE, anchor="lm")
+        else:
+            d.text((1134, y0 + 39), lines[0], font=f, fill=WHITE, anchor="lm")
+    # --- bottom ---
+    _banner(canvas, (0, 618, 560, 714), (BLACK, (35, 35, 40)), rng, rough=4, skew=0, torn_right=True)
+    runs = [(cp["slogan_a"] + " ", WHITE), (cp["slogan_b"], YELLOW)]
+    _draw_runs(d, runs, 280, 668, _fit_runs(d, runs, 500, 64, 52, stroke=0), stroke=0)
+    if price:
+        _banner(canvas, (650, 636, 1262, 716), (RED, DARK_RED), rng, skew=8)
+        runs = [(price, WHITE), (" | ", WHITE), ("Buy Now!", YELLOW)]
+        _draw_runs(d, runs, 956, 678, _fit_runs(d, runs, 560, 66, 54), stroke=3)
+    else:
+        _banner(canvas, (650, 636, 1262, 716), (RED, DARK_RED), rng, skew=8)
+        _draw_runs(d, [("Full Review ", WHITE), ("2026", YELLOW)], 956, 678, _font(50), stroke=3)
+
+
+def render_style_b(canvas, ctx, rng):
+    d = ImageDraw.Draw(canvas)
+    cp, price, name = ctx["copy"], ctx["price"], ctx["name"]
+    # --- top: hook banner + name strip ---
+    _banner(canvas, (30, 78, 860, 176), (YELLOW, (255, 170, 0)), rng, skew=8)
+    _centered(d, cp["hook"], (44, 82, 846, 172), BLACK, 74, stroke=0)
+    _banner(canvas, (30, 174, 860, 238), (RED, DARK_RED), rng, rough=3, skew=8)
+    _centered(d, name, (44, 178, 846, 234), WHITE, 40, stroke=2, stroke_fill=BLACK)
+    # --- price starburst ---
+    cx, cy = 1110, 178
+    _paint_poly(canvas, [(x + 6, y + 8) for x, y in _burst_pts(cx, cy, 150, 122, 24)], (0, 0, 0))
+    _paint_poly(canvas, _burst_pts(cx, cy, 150, 122, 24), (YELLOW, (255, 150, 0)))
+    _paint_poly(canvas, _burst_pts(cx, cy, 128, 112, 24), (RED, DARK_RED))
+    if price:
+        d.text((cx, cy - 56), "सिर्फ", font=_font(34), fill=WHITE, anchor="mm", stroke_width=2, stroke_fill=BLACK)
+        f = _fit_font(d, price, 208, 80, 80)
+        d.text((cx, cy), price, font=f, fill=YELLOW, anchor="mm", stroke_width=4, stroke_fill=BLACK)
+        d.text((cx, cy + 58), "में", font=_font(34), fill=WHITE, anchor="mm", stroke_width=2, stroke_fill=BLACK)
+    else:
+        d.text((cx, cy - 12), "FULL", font=_font(52, True), fill=YELLOW, anchor="mm", stroke_width=3, stroke_fill=BLACK)
+        d.text((cx, cy + 42), "REVIEW", font=_font(44, True), fill=WHITE, anchor="mm", stroke_width=3, stroke_fill=BLACK)
+    # --- bottom: 3 feature chips ---
+    items = []
+    if ctx["rating"]:
+        items.append(f"{ctx['rating']} Star Rating")
+    for l1, l2 in ctx["copy"]["badges"]:
+        items.append((l1 + " " + l2).strip())
+    for i, text in enumerate(items[:3]):
+        x0 = 452 + i * 272
+        _rounded(canvas, (x0, 618, x0 + 258, 700), 24, ((20, 20, 40), (55, 40, 110)), outline=YELLOW, width=3)
+        _icon(canvas, "tick", x0 + 36, 659, 20)
+        f = _fit_font(d, text, 170, 56, 30)
+        d.text((x0 + 68, 659), text, font=f, fill=WHITE, anchor="lm")
+
+
+def render_style_c(canvas, ctx, rng):
+    d = ImageDraw.Draw(canvas)
+    cp, price, name = ctx["copy"], ctx["price"], ctx["name"]
+    words = rng.choice([("HONEST", "REVIEW"), ("REAL", "TEST"), ("FULL", "REVIEW")])
+    _banner(canvas, (430, 28, 980, 142), (BLACK, (40, 40, 48)), rng, skew=12)
+    _centered(d, words[0], (442, 30, 970, 140), WHITE, 96, big=True, stroke=3)
+    _banner(canvas, (450, 146, 1010, 252), (RED, DARK_RED), rng, skew=12)
+    _centered(d, words[1], (462, 148, 1000, 250), YELLOW, 92, big=True, stroke=5)
+    # --- checklist ---
+    checks = list(cp["checks"])
+    if ctx["rating"]:
+        checks.insert(0, f"{ctx['rating']} Star Rating")
+    for i, text in enumerate(checks[:3]):
+        y = 318 + i * 66
+        _icon(canvas, "tick", 462, y, 24)
+        f = _fit_font(d, text, 330, 50, 38)
+        d.text((500, y), text, font=f, fill=WHITE, anchor="lm", stroke_width=4, stroke_fill=BLACK)
+    # --- name strip + price ribbon ---
+    _banner(canvas, (434, 520, 900, 580), YELLOW, rng, rough=3, skew=8)
+    _centered(d, name, (444, 524, 890, 576), BLACK, 36, stroke=0)
+    if price:
+        _banner(canvas, (430, 596, 930, 692), (RED, DARK_RED), rng, skew=8)
+        runs = [("सिर्फ ", WHITE), (price, YELLOW)]
+        _draw_runs(d, runs, 680, 646, _fit_runs(d, runs, 450, 76, 70), stroke=4)
+    else:
+        _banner(canvas, (430, 596, 930, 692), (RED, DARK_RED), rng, skew=8)
+        _draw_runs(d, [("देखो ", WHITE), ("पूरा रिव्यू", YELLOW)], 680, 646, _font(56), stroke=4)
 
 
 # ==========================================
@@ -411,88 +908,82 @@ def generate_youtube_thumbnail(
     product_name: str, price: str = "", specs: dict = None, category: str = None,
     output_path: str = "thumbnail.jpg", reference_face_path: str = None,
     seed: int = None, max_retries: int = 3, product_image_path: str = None,
+    style: str = None,
 ) -> str | None:
-    """Generate the full 16:9 thumbnail with Gemini; use the real product photo as reference."""
-    from google import genai
-    from google.genai import types
+    """1280x720 thumbnail banata hai. Kuch bhi fail ho to bhi ek achha thumbnail banta hai."""
+    try:
+        specs = specs or {}
+        rng = random.Random(seed)
+        style = (style or os.getenv("THUMB_STYLE", "") or rng.choice(STYLES)).strip().upper()
+        if style not in STYLES:
+            style = rng.choice(STYLES)
+        name = _clean_product_name(product_name)
+        category = category or detect_category(product_name, specs)
+        price_text = _extract_price(price, specs)
+        rating = _find_rating(specs)
+        print(f"🎨 Thumbnail style={style}, category={category}, price={price_text or '—'}, rating={rating or '—'}")
 
-    prompt = build_thumbnail_prompt(product_name, price, specs, category)
-    api_keys = [os.getenv(f"GEMINI_API_KEY_{i}", "").strip() for i in (1, 2, 3)]
-    api_keys = [key for key in api_keys if key]
-    if not api_keys:
-        print("❌ Gemini image generation requires GEMINI_API_KEY_1 (or _2/_3) in GitHub Secrets.")
+        copy = _build_copy(name, price_text, category, specs)
+        prod, kind = _prepare_product(product_image_path)
+        print(f"🖼️ Product image mode: {kind}")
+
+        # --- background ---
+        if style == "A":
+            canvas = _ai_background(category) or _bg_room_fallback(rng)
+        elif style == "B":
+            canvas = _bg_neon(rng)
+        else:
+            canvas = _bg_diagonal(rng)
+        canvas = canvas.convert("RGBA")
+        _vignette(canvas, 0.35 if style == "A" else 0.5)
+
+        # --- product ---
+        boxes = {"A": (796, 170, 1050, 590), "B": (500, 232, 980, 596), "C": (940, 130, 1270, 610)}
+        glow = {"A": ((255, 240, 200), 120), "B": ((255, 210, 60), 130), "C": ((255, 245, 210), 170)}
+        bx = boxes[style]
+        gcol, galpha = glow[style]
+        _glow(canvas, (bx[0] + bx[2]) // 2, (bx[1] + bx[3]) // 2, (bx[2] - bx[0]) // 2 + 30,
+              (bx[3] - bx[1]) // 2 + 10, gcol, galpha, 45)
+        if prod is not None:
+            if style == "A":
+                _neon_rings(canvas, (bx[0] + bx[2]) // 2, bx[3] - 20, 360)
+            px, py, pw, ph = _place_product(canvas, prod, kind, bx)
+
+        # --- face ---
+        _place_face(canvas, _pick_face(reference_face_path, rng))
+
+        # --- text layers ---
+        ctx = dict(copy=copy, price=price_text, name=name, rating=rating, category=category)
+        {"A": render_style_a, "B": render_style_b, "C": render_style_c}[style](canvas, ctx, rng)
+        _brand_tag(canvas)
+
+        out = canvas.convert("RGB")
+        os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
+        quality = 94
+        out.save(output_path, "JPEG", quality=quality, optimize=True)
+        while os.path.getsize(output_path) > 1_900_000 and quality > 60:   # YouTube limit 2MB
+            quality -= 6
+            out.save(output_path, "JPEG", quality=quality, optimize=True)
+        print(f"✅ Thumbnail saved: {output_path} ({os.path.getsize(output_path) // 1024} KB)")
+        return output_path
+    except Exception as exc:
+        import traceback
+        print(f"❌ Thumbnail generation failed: {exc}\n{traceback.format_exc()[-1500:]}")
         return None
 
-    model = os.getenv("GEMINI_IMAGE_MODEL", "gemini-3.1-flash-image").strip()
-    models = [model]
-    if model != "gemini-2.5-flash-image":
-        models.append("gemini-2.5-flash-image")
-
-    contents = [prompt]
-    if product_image_path and os.path.isfile(product_image_path):
-        try:
-            with Image.open(product_image_path) as source:
-                contents.append(source.convert("RGB").copy())
-            print("🖼️ Actual article product photo sent to Gemini as visual reference.")
-        except Exception as exc:
-            print(f"⚠️ Product reference photo could not be loaded: {exc}")
-
-    last_error = None
-    for model_name in models:
-        for key_no, api_key in enumerate(api_keys, 1):
-            client = genai.Client(api_key=api_key)
-            for attempt in range(1, max_retries + 1):
-                try:
-                    print(f"🎨 Gemini thumbnail: model={model_name}, key={key_no}, attempt={attempt}")
-                    response = client.models.generate_content(
-                        model=model_name,
-                        contents=contents,
-                        config=types.GenerateContentConfig(
-                            response_modalities=["IMAGE"],
-                            image_config=types.ImageConfig(aspect_ratio="16:9"),
-                        ),
-                    )
-                    for part in response.parts:
-                        if getattr(part, "inline_data", None) is not None:
-                            generated = part.as_image().convert("RGB")
-                            generated = ImageOps.fit(
-                                generated, (THUMB_WIDTH, THUMB_HEIGHT),
-                                method=Image.Resampling.LANCZOS, centering=(0.5, 0.5)
-                            )
-                            os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
-                            generated.save(output_path, "JPEG", quality=94, optimize=True)
-                            print(f"✅ Complete Gemini thumbnail saved: {output_path}")
-                            return output_path
-                    raise RuntimeError("Gemini response contained no image data.")
-                except Exception as exc:
-                    last_error = exc
-                    print(f"⚠️ Gemini image attempt failed: {exc}")
-                    time.sleep(2 + attempt)
-    print(f"❌ Gemini thumbnail generation failed: {last_error}")
-    return None
-
 
 # ==========================================
-# Quick test
+# Quick test:  python thumbnail_gen.py [photo.jpg] [A|B|C]
 # ==========================================
 if __name__ == "__main__":
-    print("=" * 60)
-    print("Testing Audio (Speaker) thumbnail...")
-    result = generate_youtube_thumbnail(
-        product_name="ultiads TJ-54/K Tower Multimedia System",
-        price="₹6,999",
-        specs={
-            "power": "130W",
-            "bass": "Deep Bass",
-            "bt": "Bluetooth",
-            "usb": "USB/SD",
-            "fm": "FM Radio",
-        },
-        category="audio",
-        output_path="/home/workdir/artifacts/test_audio_thumb.jpg",
-        seed=42,
+    import sys
+    photo = sys.argv[1] if len(sys.argv) > 1 else None
+    st = sys.argv[2] if len(sys.argv) > 2 else None
+    res = generate_youtube_thumbnail(
+        product_name="DREAME L50 Ultra CE Robot Vacuum and Mop",
+        price="₹64,999",
+        specs={"Rating": "4.2 out of 5", "Station": "All-in-One Auto Station", "Control": "Smart App Control",
+               "Type": "Vacuum & Mop"},
+        output_path="bot_outputs/test_thumb.jpg", product_image_path=photo, style=st, seed=7,
     )
-    if result:
-        print(f"\n🎉 Audio test successful → {result}")
-    else:
-        print("\n❌ Audio test failed")
+    print("OK" if res else "FAILED", res or "")

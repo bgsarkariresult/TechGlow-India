@@ -11,8 +11,10 @@ Kaam kaise karta hai:
 
 Styles:
   A = Banner   (red/yellow brush banners + 4 rang-birange badges, room background)
-  B = Price    (dark neon background + bada price starburst + 3 feature chips)
-  C = Honest   (diagonal rang + "HONEST REVIEW" + checklist + price ribbon)
+  B = Studio   (peela top band, "BRAND Review 2026" title, 6 feature capsules)  -- POCO-style
+  C = Brand    (neela background, bada brand naam, peela brush banner, laal strip) -- Motorola-style
+
+Channel naam badalna ho to env THUMB_CHANNEL_NAME set karo (default: TechGlow India).
 
 Usage:
     from thumbnail_gen import generate_youtube_thumbnail
@@ -49,6 +51,7 @@ FONT_MAIN = ASSETS_DIR / "fonts" / "Poppins-Bold.ttf"          # Hindi + English
 FONT_BIG = ASSETS_DIR / "fonts" / "ArchivoBlack-Regular.ttf"   # sirf English bade shabd
 
 STYLES = ("A", "B", "C")
+CHANNEL_NAME = os.getenv("THUMB_CHANNEL_NAME", "TechGlow India").strip() or "TechGlow India"
 
 RED = (222, 18, 28)
 DARK_RED = (170, 10, 20)
@@ -373,10 +376,6 @@ def _star_pts(cx, cy, r_out, r_in, n=5, rot=-90):
     return pts
 
 
-def _burst_pts(cx, cy, r_out, r_in, n=22):
-    return _star_pts(cx, cy, r_out, r_in, n=n, rot=-90)
-
-
 def _rounded(canvas, box, radius, fill, outline=None, width=0, ss=3):
     x0, y0, x1, y1 = [int(v) for v in box]
     bw, bh = x1 - x0, y1 - y0
@@ -498,38 +497,32 @@ def _ai_background(category: str):
     return None
 
 
-def _bg_neon(rng):
-    """Style B: dark neon (navy → purple) + roshni ki kirnein."""
-    yy, xx = np.mgrid[0:H, 0:W].astype(np.float32)
-    d = np.sqrt(((xx - 760) / 760) ** 2 + ((yy - 330) / 520) ** 2)
-    t = np.clip(d, 0, 1)[..., None]
-    inner, outer = np.array([120, 40, 190], np.float32), np.array([8, 10, 38], np.float32)
-    img = Image.fromarray((inner * (1 - t) + outer * t).astype(np.uint8), "RGB").convert("RGBA")
-    rays = Image.new("RGBA", (W, H), (0, 0, 0, 0))
-    rd = ImageDraw.Draw(rays)
-    for i in range(14):
-        a0 = math.radians(i * 360 / 14)
-        a1 = a0 + math.radians(9)
-        rd.polygon([(780, 340), (780 + 1500 * math.cos(a0), 340 + 1500 * math.sin(a0)),
-                    (780 + 1500 * math.cos(a1), 340 + 1500 * math.sin(a1))], fill=(255, 255, 255, 18))
-    img.alpha_composite(rays.filter(ImageFilter.GaussianBlur(6)))
-    _bokeh(img, rng, n=16, colors=((0, 220, 255), (255, 60, 200), (255, 220, 60)), alpha=(25, 60), rmin=14, rmax=50)
+def _bg_studio(rng):
+    """Style B: upar peela band, neeche halka grey studio (POCO-style)."""
+    band_h = 200
+    img = _gradient((W, H), (206, 213, 224), (150, 158, 172)).convert("RGBA")
+    floor = Image.new("RGBA", (W, H), (0, 0, 0, 0))
+    ImageDraw.Draw(floor).ellipse((-200, 560, W + 200, H + 260), fill=(236, 238, 244, 230))
+    img.alpha_composite(floor.filter(ImageFilter.GaussianBlur(30)))
+    _bokeh(img, rng, n=10, colors=((255, 255, 255), (190, 215, 255)), alpha=(35, 80), rmin=24, rmax=70)
+    band = _gradient((W, band_h), (255, 228, 24), (255, 204, 0)).convert("RGBA")
+    img.alpha_composite(band, (0, 0))
+    ImageDraw.Draw(img).rectangle((0, band_h, W, band_h + 4), fill=(190, 150, 0, 255))
     return img
 
 
-def _bg_diagonal(rng):
-    """Style C: diagonal rang – baayen neela/purple, daayen garam orange glow."""
+def _bg_blue(rng):
+    """Style C: gehra neela gradient + neeche lakdi ki table (Motorola-style)."""
     yy, xx = np.mgrid[0:H, 0:W].astype(np.float32)
-    t = np.clip((xx / W) * 0.85 + (yy / H) * 0.15, 0, 1)[..., None]
-    a, b = np.array([20, 24, 110], np.float32), np.array([150, 40, 170], np.float32)
-    arr = a * (1 - t) + b * t
-    g = np.exp(-(((xx - 1010) / 380) ** 2 + ((yy - 380) / 330) ** 2))[..., None]
-    arr = arr * (1 - g * 0.9) + np.array([255, 170, 30], np.float32) * g * 0.9
-    img = Image.fromarray(np.clip(arr, 0, 255).astype(np.uint8), "RGB").convert("RGBA")
-    layer = Image.new("RGBA", (W, H), (0, 0, 0, 0))
-    ImageDraw.Draw(layer).polygon([(0, H), (520, 0), (610, 0), (110, H)], fill=(255, 255, 255, 16))
-    img.alpha_composite(layer)
-    _bokeh(img, rng, n=12, colors=((255, 255, 255), (255, 210, 120)), alpha=(25, 55), rmin=16, rmax=55)
+    d = np.sqrt(((xx - 820) / 900) ** 2 + ((yy - 300) / 620) ** 2)
+    t = np.clip(d, 0, 1)[..., None]
+    inner, outer = np.array([20, 120, 255], np.float32), np.array([4, 30, 140], np.float32)
+    img = Image.fromarray((inner * (1 - t) + outer * t).astype(np.uint8), "RGB").convert("RGBA")
+    _bokeh(img, rng, n=10, colors=((120, 190, 255), (255, 255, 255)), alpha=(25, 60), rmin=20, rmax=60)
+    table_y = 648
+    table = _gradient((W, H - table_y), (168, 112, 70), (92, 56, 30)).convert("RGBA")
+    img.alpha_composite(table, (0, table_y))
+    ImageDraw.Draw(img).rectangle((0, table_y, W, table_y + 3), fill=(215, 165, 120, 255))
     return img
 
 
@@ -655,6 +648,14 @@ def _place_face(canvas, path, max_h=575, max_w=440, x=-12, bottom=H + 8):
         face = face.crop(bbox)
     s = min(max_h / face.height, max_w / face.width)
     face = face.resize((int(face.width * s), int(face.height * s)), Image.Resampling.LANCZOS)
+    # photo ka daayan kinara kata hua ho (kapde/ungli seedhi line me kati) to use halka fade kar do
+    arr = np.array(face.getchannel("A"))
+    if (arr[:, -2] > 128).sum() > 12:
+        fade = min(44, face.width // 6)
+        ramp = np.ones(face.width, dtype=np.float32)
+        ramp[-fade:] = np.linspace(1.0, 0.0, fade)
+        arr = (arr.astype(np.float32) * ramp[None, :]).astype(np.uint8)
+        face.putalpha(Image.fromarray(arr, "L"))
     fx, fy = x, bottom - face.height
     a = face.getchannel("A")
     shadow = Image.new("RGBA", (W, H), (0, 0, 0, 0))
@@ -771,8 +772,8 @@ def _build_copy(product, price, category, specs):
 def _brand_tag(canvas):
     _rounded(canvas, (12, 12, 262, 66), 14, BLACK, outline=WHITE, width=2)
     d = ImageDraw.Draw(canvas)
-    f = _fit_font(d, "TECHGLOW INDIA", 218, 30, 26, big=True)
-    d.text((137, 39), "TECHGLOW INDIA", font=f, fill=WHITE, anchor="mm")
+    f = _fit_font(d, CHANNEL_NAME.upper(), 218, 30, 26, big=True)
+    d.text((137, 39), CHANNEL_NAME.upper(), font=f, fill=WHITE, anchor="mm")
 
 
 def _centered(d, text, box, color, start, big=False, stroke=3, stroke_fill=BLACK):
@@ -837,68 +838,121 @@ def render_style_a(canvas, ctx, rng):
         _draw_runs(d, [("Full Review ", WHITE), ("2026", YELLOW)], 956, 678, _font(50), stroke=3)
 
 
+def _brand_of(name: str):
+    """Naam ke pehle shabd se brand aur baaki model nikalta hai."""
+    parts = name.split()
+    if len(parts) >= 2 and re.fullmatch(r"[A-Za-z][A-Za-z0-9&+-]{1,14}", parts[0]):
+        return parts[0], " ".join(parts[1:])
+    return "", name
+
+
+_SPEC_TOKEN = re.compile(r"^\(?\d+\s?(GB|TB)\)?$|^5G$|^4G$|^\(.*\)$", re.I)
+
+
+def _name_runs(name):
+    """Naam me model laal, storage/5G jaise tukde kaale rang me."""
+    runs = []
+    for tok in name.split():
+        color = BLACK if _SPEC_TOKEN.match(tok) else RED
+        runs.append((tok + " ", color))
+    return runs
+
+
+def _pill_icon(canvas, kind, cx, cy, r, ring):
+    d = ImageDraw.Draw(canvas)
+    d.ellipse((cx - r, cy - r, cx + r, cy + r), fill=(18, 22, 40), outline=ring, width=4)
+    k = r * 0.5
+    if kind == "star":
+        _paint_poly(canvas, _star_pts(cx, cy + 1, k * 1.2, k * 0.5), (255, 190, 20))
+    elif kind == "bolt":
+        _paint_poly(canvas, [(cx + k * .2, cy - k * 1.2), (cx - k * .8, cy + k * .2), (cx - k * .05, cy + k * .2),
+                             (cx - k * .3, cy + k * 1.2), (cx + k * .85, cy - k * .25), (cx + k * .1, cy - k * .25)],
+                    (255, 214, 10))
+    elif kind == "rupee":
+        d.text((cx, cy), "₹", font=_font(int(r * 1.2)), fill=YELLOW, anchor="mm")
+    else:
+        d.line([(cx - k * .9, cy), (cx - k * .2, cy + k * .7), (cx + k * .95, cy - k * .7)],
+               fill=(70, 230, 110), width=max(4, int(r * .26)), joint="curve")
+
+
 def render_style_b(canvas, ctx, rng):
+    """Peela band + title box + 6 feature capsules (POCO-style)."""
     d = ImageDraw.Draw(canvas)
     cp, price, name = ctx["copy"], ctx["price"], ctx["name"]
-    # --- top: hook banner + name strip ---
-    _banner(canvas, (30, 78, 860, 176), (YELLOW, (255, 170, 0)), rng, skew=8)
-    _centered(d, cp["hook"], (44, 82, 846, 172), BLACK, 74, stroke=0)
-    _banner(canvas, (30, 174, 860, 238), (RED, DARK_RED), rng, rough=3, skew=8)
-    _centered(d, name, (44, 178, 846, 234), WHITE, 40, stroke=2, stroke_fill=BLACK)
-    # --- price starburst ---
-    cx, cy = 1110, 178
-    _paint_poly(canvas, [(x + 6, y + 8) for x, y in _burst_pts(cx, cy, 150, 122, 24)], (0, 0, 0))
-    _paint_poly(canvas, _burst_pts(cx, cy, 150, 122, 24), (YELLOW, (255, 150, 0)))
-    _paint_poly(canvas, _burst_pts(cx, cy, 128, 112, 24), (RED, DARK_RED))
-    if price:
-        d.text((cx, cy - 56), "सिर्फ", font=_font(34), fill=WHITE, anchor="mm", stroke_width=2, stroke_fill=BLACK)
-        f = _fit_font(d, price, 208, 80, 80)
-        d.text((cx, cy), price, font=f, fill=YELLOW, anchor="mm", stroke_width=4, stroke_fill=BLACK)
-        d.text((cx, cy + 58), "में", font=_font(34), fill=WHITE, anchor="mm", stroke_width=2, stroke_fill=BLACK)
-    else:
-        d.text((cx, cy - 12), "FULL", font=_font(52, True), fill=YELLOW, anchor="mm", stroke_width=3, stroke_fill=BLACK)
-        d.text((cx, cy + 42), "REVIEW", font=_font(44, True), fill=WHITE, anchor="mm", stroke_width=3, stroke_fill=BLACK)
-    # --- bottom: 3 feature chips ---
+    brand, model = _brand_of(name)
+    # --- top row ---
+    if brand:
+        _rounded(canvas, (12, 12, 214, 92), 10, (255, 196, 0), outline=(190, 140, 0), width=2)
+        _centered(d, brand.upper(), (18, 16, 208, 88), BLACK, 46, stroke=0)
+    title = f"{brand} Review 2026".strip() if brand else "Full Review 2026"
+    _rounded(canvas, (236, 14, 946, 106), 14, BLACK)
+    _centered(d, title, (248, 18, 934, 102), WHITE, 70, stroke=0)
+    _rounded(canvas, (974, 20, 1268, 90), 10, BLACK)
+    f = _fit_font(d, CHANNEL_NAME, 270, 40, 36)
+    d.text((1121, 55), CHANNEL_NAME, font=f, fill=WHITE, anchor="mm")
+    # --- product name (model laal, 5G / storage kaala) ---
+    runs = _name_runs(name)
+    f = _fit_runs(d, runs, 1180, 78, 84, stroke=0)
+    _draw_runs(d, runs, 640, 150, f, stroke=0)
+    # --- feature capsules ---
     items = []
     if ctx["rating"]:
-        items.append(f"{ctx['rating']} Star Rating")
-    for l1, l2 in ctx["copy"]["badges"]:
-        items.append((l1 + " " + l2).strip())
-    for i, text in enumerate(items[:3]):
-        x0 = 452 + i * 272
-        _rounded(canvas, (x0, 618, x0 + 258, 700), 24, ((20, 20, 40), (55, 40, 110)), outline=YELLOW, width=3)
-        _icon(canvas, "tick", x0 + 36, 659, 20)
-        f = _fit_font(d, text, 170, 56, 30)
-        d.text((x0 + 68, 659), text, font=f, fill=WHITE, anchor="lm")
+        items.append((f"{ctx['rating']} Star", "Rating", "star"))
+    for i, (l1, l2) in enumerate(cp["badges"]):
+        items.append((l1, l2, cp["icons"][i % len(cp["icons"])]))
+    if price:
+        items.append((price, "Price in India", "rupee"))
+    items = items[:6]
+    rings = [(150, 90, 230), (40, 130, 255), (60, 200, 90), (255, 160, 30), (235, 60, 150), (30, 200, 215)]
+    n, ph = len(items), 64
+    gap = min(12, (418 - n * ph) / max(1, n - 1)) if n > 1 else 0
+    for i, (l1, l2, ic) in enumerate(items):
+        y0 = 208 + i * (ph + gap)
+        _rounded(canvas, (1066, y0, 1270, y0 + ph), 30, ((16, 20, 36), (30, 34, 58)), outline=rings[i % 6], width=3)
+        _pill_icon(canvas, ic, 1099, y0 + ph / 2, 23, rings[i % 6])
+        f1 = _fit_font(d, l1, 116, 28, 26)
+        if l2:
+            d.text((1134, y0 + 21), l1, font=f1, fill=WHITE, anchor="lm")
+            f2 = _fit_font(d, l2, 116, 24, 20)
+            d.text((1134, y0 + 46), l2, font=f2, fill=(200, 206, 225), anchor="lm")
+        else:
+            d.text((1134, y0 + ph / 2), l1, font=f1, fill=WHITE, anchor="lm")
+    # --- bottom texts ---
+    d.text((26, 640), "Review & Check:", font=_font(54), fill=YELLOW, anchor="lm", stroke_width=5, stroke_fill=BLACK)
+    d.text((26, 692), "Best for 2026?", font=_font(58), fill=WHITE, anchor="lm", stroke_width=5, stroke_fill=BLACK)
+    f = _font(60)
+    d.text((1000, 676), "CHECK PRICE!" if price else "CHECK HERE!", font=f, fill=RED, anchor="mm",
+           stroke_width=5, stroke_fill=WHITE)
 
 
 def render_style_c(canvas, ctx, rng):
+    """Neela background + bada brand naam + peela brush banner + laal strip (Motorola-style)."""
     d = ImageDraw.Draw(canvas)
     cp, price, name = ctx["copy"], ctx["price"], ctx["name"]
-    words = rng.choice([("HONEST", "REVIEW"), ("REAL", "TEST"), ("FULL", "REVIEW")])
-    _banner(canvas, (430, 28, 980, 142), (BLACK, (40, 40, 48)), rng, skew=12)
-    _centered(d, words[0], (442, 30, 970, 140), WHITE, 96, big=True, stroke=3)
-    _banner(canvas, (450, 146, 1010, 252), (RED, DARK_RED), rng, skew=12)
-    _centered(d, words[1], (462, 148, 1000, 250), YELLOW, 92, big=True, stroke=5)
-    # --- checklist ---
-    checks = list(cp["checks"])
-    if ctx["rating"]:
-        checks.insert(0, f"{ctx['rating']} Star Rating")
-    for i, text in enumerate(checks[:3]):
-        y = 318 + i * 66
-        _icon(canvas, "tick", 462, y, 24)
-        f = _fit_font(d, text, 330, 50, 38)
-        d.text((500, y), text, font=f, fill=WHITE, anchor="lm", stroke_width=4, stroke_fill=BLACK)
-    # --- name strip + price ribbon ---
-    _banner(canvas, (434, 520, 900, 580), YELLOW, rng, rough=3, skew=8)
-    _centered(d, name, (444, 524, 890, 576), BLACK, 36, stroke=0)
+    brand, model = _brand_of(name)
+    brand_text = (brand or "NEW REVIEW").upper()
+    _centered(d, brand_text, (500, 6, 1250, 104), WHITE, 96, big=True, stroke=3, stroke_fill=(10, 30, 110))
+    # --- yellow brush banner with model name ---
+    _banner(canvas, (470, 108, 1262, 250), YELLOW, rng, rough=9, skew=10)
+    _centered(d, model.upper(), (492, 114, 1244, 246), BLACK, 118, big=True, stroke=0)
+    # --- red strip: price | storage | rating ---
+    parts = []
     if price:
-        _banner(canvas, (430, 596, 930, 692), (RED, DARK_RED), rng, skew=8)
-        runs = [("सिर्फ ", WHITE), (price, YELLOW)]
-        _draw_runs(d, runs, 680, 646, _fit_runs(d, runs, 450, 76, 70), stroke=4)
-    else:
-        _banner(canvas, (430, 596, 930, 692), (RED, DARK_RED), rng, skew=8)
-        _draw_runs(d, [("देखो ", WHITE), ("पूरा रिव्यू", YELLOW)], 680, 646, _font(56), stroke=4)
+        parts.append(price)
+    for fct in _short_facts(ctx["specs"], 6):
+        if re.fullmatch(r"\d+\s?(GB|TB)(\s?(SSD|ROM|Storage))?", fct, re.I):
+            tag = fct.upper().replace(" ", "")
+            core = re.match(r"\d+(?:GB|TB)", tag).group(0)
+            if core not in model.upper().replace(" ", ""):      # naam me pehle se ho to dohrana nahi
+                parts.append(tag)
+            break
+    if ctx["rating"]:
+        parts.append(f"{ctx['rating']} STAR RATING")
+    if not parts:
+        parts = ["FULL REVIEW 2026"]
+    text = " | ".join(parts[:3])
+    _banner(canvas, (560, 244, 1226, 328), (RED, DARK_RED), rng, rough=6, skew=12)
+    _centered(d, text, (582, 248, 1206, 324), WHITE, 66, big=False, stroke=3, stroke_fill=BLACK)
 
 
 # ==========================================
@@ -931,15 +985,15 @@ def generate_youtube_thumbnail(
         if style == "A":
             canvas = _ai_background(category) or _bg_room_fallback(rng)
         elif style == "B":
-            canvas = _bg_neon(rng)
+            canvas = _bg_studio(rng)
         else:
-            canvas = _bg_diagonal(rng)
+            canvas = _bg_blue(rng)
         canvas = canvas.convert("RGBA")
-        _vignette(canvas, 0.35 if style == "A" else 0.5)
+        _vignette(canvas, {"A": 0.35, "B": 0.2, "C": 0.3}[style])
 
         # --- product ---
-        boxes = {"A": (796, 170, 1050, 590), "B": (500, 232, 980, 596), "C": (940, 130, 1270, 610)}
-        glow = {"A": ((255, 240, 200), 120), "B": ((255, 210, 60), 130), "C": ((255, 245, 210), 170)}
+        boxes = {"A": (796, 170, 1050, 590), "B": (450, 208, 1050, 630), "C": (690, 338, 1270, 668)}
+        glow = {"A": ((255, 240, 200), 120), "B": ((255, 255, 255), 130), "C": ((140, 200, 255), 150)}
         bx = boxes[style]
         gcol, galpha = glow[style]
         _glow(canvas, (bx[0] + bx[2]) // 2, (bx[1] + bx[3]) // 2, (bx[2] - bx[0]) // 2 + 30,
@@ -950,12 +1004,19 @@ def generate_youtube_thumbnail(
             px, py, pw, ph = _place_product(canvas, prod, kind, bx)
 
         # --- face ---
-        _place_face(canvas, _pick_face(reference_face_path, rng))
+        face_path = _pick_face(reference_face_path, rng)
+        if style == "C":
+            _place_face(canvas, face_path, max_h=660, max_w=480, x=-22)    # C me chehra bada
+        elif style == "B":
+            _place_face(canvas, face_path, max_h=600, max_w=430)
+        else:
+            _place_face(canvas, face_path)
 
         # --- text layers ---
-        ctx = dict(copy=copy, price=price_text, name=name, rating=rating, category=category)
+        ctx = dict(copy=copy, price=price_text, name=name, rating=rating, category=category, specs=specs)
         {"A": render_style_a, "B": render_style_b, "C": render_style_c}[style](canvas, ctx, rng)
-        _brand_tag(canvas)
+        if style != "B":                       # B me channel tag upar-daayen already hai
+            _brand_tag(canvas)
 
         out = canvas.convert("RGB")
         os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
